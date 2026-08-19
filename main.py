@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 from datetime import datetime, timedelta
+import ssl
 
 # -------------------------------------------------------------
 # AUTOMATIC LOG FILE GENERATOR
@@ -42,6 +43,30 @@ logger.info("==========================================")
 # -------------------------------------------------------------
 # Password applied to exported attendance .xlsx reports (open-to-view lock).
 REPORT_EXPORT_PASSWORD = "Rohi@3313@"
+
+# -------------------------------------------------------------
+# HTTPS certificate verification.
+# Pydroid 3 (and some stripped-down Android Python builds) do not wire up
+# the OS certificate store to Python's ssl module, so a plain urlopen() to
+# any https:// endpoint fails with CERTIFICATE_VERIFY_FAILED even though
+# the site's certificate is perfectly valid. certifi ships an up-to-date,
+# independent CA bundle that works regardless of what the OS exposes, so it
+# is used here whenever it's installed. If certifi isn't installed, this
+# falls back to Python's normal default context (works fine in a packaged
+# APK build, where python-for-android bundles its own CA store).
+def _rohi_ssl_context():
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        try:
+            return ssl.create_default_context()
+        except Exception:
+            logger.exception("Could not build any SSL context; HTTPS requests may fail.")
+            return None
+
+
+ROHI_SSL_CONTEXT = _rohi_ssl_context()
 
 # -------------------------------------------------------------
 # Attendance reminder schedule (Monday-Thursday only; Friday is WFH
@@ -87,6 +112,90 @@ EXCEL_SYNC_DEFAULTS = {
     "last_leave_sync": "",
     "link_status": {"attendance": False, "timesheet": False, "leave": False, "staff": False},
 }
+
+# -------------------------------------------------------------
+# DHIS2 integration configuration.
+# All UIDs (program, program stage, org unit, data elements, etc.) must be
+# created inside the target DHIS2 instance first, then pasted into the
+# DHIS2 Connection screen. Left blank by default - the demo instance
+# (https://play.dhis2.org/<version>) does not ship a ROHI-specific
+# program, so this needs a one-time Maintenance-app setup before use.
+DHIS2_SYNC_CONFIG_PATH = os.path.join(APP_DIR, "dhis2_sync_config.json")
+DHIS2_SYNC_DEFAULTS = {
+    "server_url": "",           # e.g. https://play.dhis2.org/40.0.0
+    "username": "",
+    "password": "",
+    "api_token": "",            # optional - takes priority over username/password
+    "org_unit": "",             # DHIS2 org unit UID for this ROHI facility/office
+    # Tracker (individual attendance records)
+    "tracked_entity_type": "",  # e.g. the "Person" tracked entity type UID
+    "program": "",              # ROHI Staff Attendance tracker program UID
+    "program_stage": "",        # attendance event program stage UID
+    "tea_staff_id": "",         # tracked entity attribute UID: Staff ID
+    "tea_full_name": "",        # tracked entity attribute UID: Full Name
+    "de_check_in": "",          # data element UID: Check-in time
+    "de_check_out": "",         # data element UID: Check-out time
+    "de_late": "",              # data element UID: Late (Yes/No)
+    "de_gps_status": "",        # data element UID: GPS/geofence status
+    # Aggregate (present/absent totals)
+    "agg_data_set": "",         # aggregate Data Set UID
+    "agg_de_present": "",       # data element UID: Present count
+    "agg_de_absent": "",        # data element UID: Absent count
+    "agg_de_late": "",          # data element UID: Late count (optional)
+    "last_status": "",
+    "connected": False,
+}
+
+
+def _load_dhis2_config():
+    data = dict(DHIS2_SYNC_DEFAULTS)
+    try:
+        if os.path.exists(DHIS2_SYNC_CONFIG_PATH):
+            with open(DHIS2_SYNC_CONFIG_PATH, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            if isinstance(saved, dict):
+                data.update(saved)
+    except Exception:
+        logger.exception("Could not load DHIS2 sync configuration.")
+    return data
+
+
+def _save_dhis2_config(data):
+    try:
+        with open(DHIS2_SYNC_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        return True
+    except Exception:
+        logger.exception("Could not save DHIS2 sync configuration.")
+        return False
+
+
+# Local map of {staff email: DHIS2 Tracked Entity Instance UID}. Kept as its
+# own small file (rather than a database column) so linking a staff member
+# to DHIS2 doesn't require a schema migration.
+DHIS2_TEI_MAP_PATH = os.path.join(APP_DIR, "dhis2_tei_map.json")
+
+
+def _load_dhis2_tei_map():
+    try:
+        if os.path.exists(DHIS2_TEI_MAP_PATH):
+            with open(DHIS2_TEI_MAP_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        logger.exception("Could not load DHIS2 tracked-entity map.")
+    return {}
+
+
+def _save_dhis2_tei_map(data):
+    try:
+        with open(DHIS2_TEI_MAP_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        return True
+    except Exception:
+        logger.exception("Could not save DHIS2 tracked-entity map.")
+        return False
 
 # -------------------------------------------------------------
 # Public holidays used to label the timesheet grid as "PUBLIC HOLIDAY"
@@ -152,7 +261,7 @@ def _http_upload_excel(filepath, endpoint, report_type):
             req = Request(endpoint, data=body, method="POST")
             req.add_header("Content-Type", "application/json")
             req.add_header("User-Agent", "ROHI-Attendance-App/1.8")
-            with urlopen(req, timeout=60) as response:
+            with urlopen(req, timeout=60, context=ROHI_SSL_CONTEXT) as response:
                 status = getattr(response, "status", 200)
                 response.read(2048)
             if status < 200 or status >= 300:
@@ -185,7 +294,7 @@ def _http_upload_excel(filepath, endpoint, report_type):
         req = Request(endpoint, data=bytes(body), method="POST")
         req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
         req.add_header("User-Agent", "ROHI-Attendance-App/1.0")
-        with urlopen(req, timeout=30) as response:
+        with urlopen(req, timeout=30, context=ROHI_SSL_CONTEXT) as response:
             status = getattr(response, "status", 200)
             response.read(1024)
         if status < 200 or status >= 300:
@@ -245,6 +354,7 @@ from server_connection_screen import ServerConnectionScreen
 import pg_sync
 import gform_sync
 import openpyxl
+import dhis2_sync
 
 # Local database handlers
 try:
@@ -367,7 +477,7 @@ STATE_OFFICES = [
 ]
 
 OFFICES = {
-    "Borno State Office": {"latitude": 11.797352, "longitude": 13.143040, "radius": 100},
+    "Borno State Office": {"latitude": 11.806543, "longitude": 13.117668, "radius": 100},
     "Adamawa HQ": {"latitude": 9.2781640, "longitude": 12.432640, "radius": 100},
     "Yobe State Office": {"latitude": 11.7460, "longitude": 11.9660, "radius": 100},
     "Taraba State Office": {"latitude": 8.8936, "longitude": 11.3595, "radius": 100},
@@ -440,6 +550,8 @@ class ROHIAttendanceApp(MDApp):
         self._session_restore_in_progress = False
         self._excel_sync_lock = threading.Lock()
         self._excel_sync_state = _load_excel_sync_config()
+        self._dhis2_sync_lock = threading.Lock()
+        self._dhis2_state = _load_dhis2_config()
         self._last_attendance_excel_sync_date = ""
         self._last_staff_excel_sync_at = ""
         self._last_timesheet_excel_sync_at = ""
@@ -803,6 +915,7 @@ class ROHIAttendanceApp(MDApp):
             ids.google_form_url_field.text = self._load_google_form_url()
         self._load_google_form_auto_sync_status()
         self._refresh_excel_sync_fields()
+        self._refresh_dhis2_fields()
 
         status = pg_sync.get_status()
         status_color = (0.1, 0.6, 0.2, 1) if status["connected"] else (0.6, 0.15, 0.15, 1)
@@ -877,7 +990,7 @@ class ROHIAttendanceApp(MDApp):
         def worker():
             try:
                 req = Request(url, headers={"User-Agent": "ROHI-Attendance-App/1.7"}, method="GET")
-                with urlopen(req, timeout=10) as response:
+                with urlopen(req, timeout=10, context=ROHI_SSL_CONTEXT) as response:
                     status = getattr(response, "status", 200)
                     response.read(256)
                 ok = 200 <= status < 400
@@ -938,6 +1051,170 @@ class ROHIAttendanceApp(MDApp):
             self.server_connection_screen.ids.excel_sync_result_label.text = message
         self._update_excel_sync_dashboard_status()
         return ok
+
+    # -----------------------------
+    # DHIS2 integration
+    # -----------------------------
+    DHIS2_FIELD_MAP = {
+        "dhis2_server_url": "server_url",
+        "dhis2_username": "username",
+        "dhis2_password": "password",
+        "dhis2_api_token": "api_token",
+        "dhis2_org_unit": "org_unit",
+        "dhis2_tracked_entity_type": "tracked_entity_type",
+        "dhis2_program": "program",
+        "dhis2_program_stage": "program_stage",
+        "dhis2_tea_staff_id": "tea_staff_id",
+        "dhis2_tea_full_name": "tea_full_name",
+        "dhis2_de_check_in": "de_check_in",
+        "dhis2_de_check_out": "de_check_out",
+        "dhis2_de_late": "de_late",
+        "dhis2_de_gps_status": "de_gps_status",
+        "dhis2_agg_data_set": "agg_data_set",
+        "dhis2_agg_de_present": "agg_de_present",
+        "dhis2_agg_de_absent": "agg_de_absent",
+        "dhis2_agg_de_late": "agg_de_late",
+    }
+
+    def _refresh_dhis2_fields(self):
+        if not hasattr(self, "server_connection_screen"):
+            return
+        ids = self.server_connection_screen.ids
+        for widget_id, key in self.DHIS2_FIELD_MAP.items():
+            if widget_id in ids:
+                ids[widget_id].text = str(self._dhis2_state.get(key) or "")
+        if "dhis2_status_label" in ids:
+            ids.dhis2_status_label.text = self._dhis2_state.get("last_status") or "Not connected"
+
+    def _collect_dhis2_form(self):
+        ids = self.server_connection_screen.ids
+        data = dict(self._dhis2_state)
+        for widget_id, key in self.DHIS2_FIELD_MAP.items():
+            if widget_id in ids:
+                data[key] = ids[widget_id].text.strip()
+        return data
+
+    def save_dhis2_settings(self):
+        data = self._collect_dhis2_form()
+        self._dhis2_state = data
+        ok = _save_dhis2_config(data)
+        message = "DHIS2 settings saved." if ok else "Could not save DHIS2 settings."
+        data["last_status"] = message
+        self._dhis2_state = data
+        if hasattr(self.server_connection_screen.ids, "dhis2_status_label"):
+            self.server_connection_screen.ids.dhis2_status_label.text = message
+        return ok
+
+    def test_dhis2_connection(self):
+        data = self._collect_dhis2_form()
+        self._dhis2_state = data
+        _save_dhis2_config(data)
+        server_url = data.get("server_url", "")
+        if not server_url:
+            self._set_dhis2_status("Enter the DHIS2 server URL first.", False)
+            return
+
+        def worker():
+            ok, message = dhis2_sync.test_connection(
+                server_url, data.get("username", ""), data.get("password", ""),
+                token=data.get("api_token") or None,
+            )
+            Clock.schedule_once(lambda dt: self._set_dhis2_status(message, ok), 0)
+        threading.Thread(target=worker, daemon=True).start()
+
+    @mainthread
+    def _set_dhis2_status(self, message, ok=True):
+        self._dhis2_state["connected"] = bool(ok)
+        self._dhis2_state["last_status"] = message
+        _save_dhis2_config(self._dhis2_state)
+        if hasattr(self, "server_connection_screen") and "dhis2_status_label" in self.server_connection_screen.ids:
+            self.server_connection_screen.ids.dhis2_status_label.text = message
+
+    def push_attendance_to_dhis2(self):
+        """Push every row of the currently generated attendance report
+        (Attendance Reports screen) to DHIS2 as individual tracker events,
+        one per staff attendance day. Requires the DHIS2 metadata UIDs to
+        be configured and a DHIS2 Tracked Entity UID already linked to the
+        logged-in staff member (see ``dhis2_tei`` on the staff record)."""
+        cfg = self._dhis2_state
+        missing = [k for k in ("server_url", "org_unit", "program", "program_stage", "tracked_entity_type") if not cfg.get(k)]
+        if missing:
+            self._set_report_send_status(f"DHIS2 not configured yet ({', '.join(missing)}).", False)
+            return
+        rows = getattr(self, "_last_report_rows", [])
+        if not rows:
+            self._set_report_send_status("Generate the report first, then push to DHIS2.", False)
+            return
+        user = self.current_user
+        tei = str(user[30]) if user and len(user) > 30 and user[30] else ""
+        if not tei:
+            self._set_report_send_status(
+                "This staff member has no DHIS2 Tracked Entity UID linked yet.", False
+            )
+            return
+
+        def worker():
+            sent, failed = 0, 0
+            for check_in, check_out, late, status, gps, checkout_gps in rows:
+                if not check_in:
+                    continue
+                event_date = check_in[:10]
+                data_values = {}
+                if cfg.get("de_check_in"):
+                    data_values[cfg["de_check_in"]] = check_in
+                if cfg.get("de_check_out") and check_out:
+                    data_values[cfg["de_check_out"]] = check_out
+                if cfg.get("de_late"):
+                    data_values[cfg["de_late"]] = "Yes" if (status and "Late" in status) else "No"
+                if cfg.get("de_gps_status") and status:
+                    data_values[cfg["de_gps_status"]] = status
+                ok, _ = dhis2_sync.push_attendance_event(
+                    cfg["server_url"], cfg.get("username", ""), cfg.get("password", ""),
+                    cfg["program"], cfg["program_stage"], cfg["org_unit"], tei, cfg["tracked_entity_type"],
+                    event_date, data_values, token=cfg.get("api_token") or None,
+                )
+                sent += 1 if ok else 0
+                failed += 0 if ok else 1
+            message = f"DHIS2: {sent} event(s) sent" + (f", {failed} failed." if failed else ".")
+            Clock.schedule_once(lambda dt: self._set_report_send_status(message, failed == 0), 0)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def push_summary_to_dhis2(self):
+        """Push the on-screen Present/Absent/Late period totals to DHIS2 as
+        one aggregate data value set for the selected reporting period."""
+        cfg = self._dhis2_state
+        missing = [k for k in ("server_url", "org_unit", "agg_data_set", "agg_de_present", "agg_de_absent") if not cfg.get(k)]
+        if missing:
+            self._set_report_send_status(f"DHIS2 aggregate not configured yet ({', '.join(missing)}).", False)
+            return
+        ids = self.reports_screen.ids
+        try:
+            present = int(re.search(r"\d+", ids.report_present_label.text).group())
+            absent = int(re.search(r"\d+", ids.report_absent_label.text).group())
+            late = int(re.search(r"\d+", ids.report_late_label.text).group())
+        except Exception:
+            self._set_report_send_status("Generate the report first, then push to DHIS2.", False)
+            return
+
+        month_name = ids.report_month_spinner.text
+        year = ids.report_year_spinner.text
+        try:
+            month_num = list(calendar.month_name).index(month_name)
+            period = f"{year}{month_num:02d}"
+        except Exception:
+            period = datetime.now().strftime("%Y%m")
+
+        def worker():
+            ok, message = dhis2_sync.push_aggregate_summary(
+                cfg["server_url"], cfg.get("username", ""), cfg.get("password", ""),
+                cfg["org_unit"], period, cfg["agg_data_set"],
+                cfg["agg_de_present"], cfg["agg_de_absent"],
+                present, absent,
+                late_data_element=cfg.get("agg_de_late") or None, late_count=late,
+                token=cfg.get("api_token") or None,
+            )
+            Clock.schedule_once(lambda dt: self._set_report_send_status(message, ok), 0)
+        threading.Thread(target=worker, daemon=True).start()
 
     def connect_excel_sync(self):
         data = self._collect_excel_sync_form()
@@ -1471,19 +1748,17 @@ class ROHIAttendanceApp(MDApp):
         raise RuntimeError(f"Android Activity is unavailable: {last_error}")
 
     def _ensure_location_permission(self):
-        """Prepare location access without using the Pydroid runtime-permission API.
+        """Check/request Android location permission in both APK and Pydroid 3.
 
-        Pydroid 3 is a normal Python environment and does not provide the
-        python-for-android ``android.permissions`` request flow.  In Pydroid,
-        the app therefore does not open or simulate a permission dialog; it
-        starts the normal Plyer GPS provider directly.  The packaged APK still
-        uses the Android permission API because Buildozer declares the location
-        permissions there.
+        Pydroid does not expose python-for-android's ``android.permissions``
+        module, so it uses Android's Activity/requestPermissions API through
+        PyJNIus when available. After the permission dialog is shown, the
+        permission state is checked again automatically.
         """
         if platform != "android":
             return True
 
-        # Packaged python-for-android APK: request permission only here.
+        # Preferred path in a Buildozer/python-for-android APK.
         try:
             from android.permissions import request_permissions, check_permission, Permission
             fine = bool(check_permission(Permission.ACCESS_FINE_LOCATION))
@@ -1497,13 +1772,67 @@ class ROHIAttendanceApp(MDApp):
             )
             return False
         except ImportError:
-            # Pydroid 3: deliberately do not call Android requestPermissions().
-            logger.info("Pydroid mode: skipping runtime location-permission request; using Plyer GPS.")
-            return True
+            pass
         except Exception:
-            logger.exception("Packaged APK location-permission request failed.")
-            self._show_gps_failure("Android Location permission could not be initialized.")
+            logger.exception("python-for-android location permission check failed; trying Pydroid/Java API.")
+
+        # Pydroid 3 fallback: use the real Android Activity permission API.
+        try:
+            from jnius import autoclass
+            PythonActivity = autoclass('org.kivy.android.PythonActivity')
+            ManifestPermission = autoclass('android.Manifest$permission')
+            PackageManager = autoclass('android.content.pm.PackageManager')
+            activity = PythonActivity.mActivity
+            fine_perm = ManifestPermission.ACCESS_FINE_LOCATION
+            coarse_perm = ManifestPermission.ACCESS_COARSE_LOCATION
+            fine_granted = activity.checkSelfPermission(fine_perm) == PackageManager.PERMISSION_GRANTED
+            coarse_granted = activity.checkSelfPermission(coarse_perm) == PackageManager.PERMISSION_GRANTED
+            if fine_granted or coarse_granted:
+                logger.info("Android/Pydroid location permission already granted.")
+                return True
+
+            self._checkin_pending = True
+            logger.info("Requesting Android location permission from Pydroid 3.")
+            activity.requestPermissions([fine_perm, coarse_perm], 7311)
+            # Android delivers the result asynchronously. Check again shortly;
+            # if the user accepted the dialog, GPS starts automatically.
+            Clock.schedule_once(lambda dt: self._finish_pydroid_permission_check(), 0.8)
             return False
+        except Exception:
+            logger.exception("Pydroid Android location permission request failed.")
+            self._show_gps_failure("Location permission could not be requested. Open Android Settings > Apps > Pydroid 3 > Permissions > Location and allow Precise Location, then try Check-In again.")
+            try:
+                self.dashboard_screen.ids.check_in_btn.disabled = False
+            except Exception:
+                pass
+            return False
+
+    def _finish_pydroid_permission_check(self):
+        """Re-check Pydroid's Android permission dialog result and continue GPS."""
+        if not self._checkin_pending:
+            return
+        try:
+            from jnius import autoclass
+            PythonActivity = autoclass('org.kivy.android.PythonActivity')
+            ManifestPermission = autoclass('android.Manifest$permission')
+            PackageManager = autoclass('android.content.pm.PackageManager')
+            activity = PythonActivity.mActivity
+            fine = activity.checkSelfPermission(ManifestPermission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+            coarse = activity.checkSelfPermission(ManifestPermission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+            if fine or coarse:
+                logger.info("Pydroid Android location permission granted; starting GPS.")
+                self._start_live_checkin_gps()
+                return
+            self._checkin_pending = False
+            self._show_gps_failure("Location permission is required. Allow Precise Location for Pydroid 3, then press Check-In again.")
+            self.dashboard_screen.ids.check_in_btn.disabled = False
+        except Exception:
+            logger.exception("Could not verify Pydroid Android location permission.")
+            self._checkin_pending = False
+            try:
+                self.dashboard_screen.ids.check_in_btn.disabled = False
+            except Exception:
+                pass
 
     @mainthread
     def _on_location_permission_result(self, permissions, grants):
@@ -2180,28 +2509,40 @@ class ROHIAttendanceApp(MDApp):
     # -----------------------------
     # Attendance Working-Day Rules
     # -----------------------------
-    @staticmethod
-    def _is_attendance_working_day(date_obj=None):
-        """Attendance capture is permitted Monday-Thursday only.
-        Friday is official Work From Home and remains in the timesheet; it is
-        not a check-in/check-out day. Saturday and Sunday are non-working days.
+    # Sections allowed to capture attendance every day of the week.
+    # All other sections retain the existing Monday-Thursday rule.
+    WEEKEND_ATTENDANCE_SECTIONS = {
+        "INFORMATION MANAGEMENT",
+        "HR",
+        "SECURITY",
+    }
+
+    def _staff_can_attend_weekends(self):
+        """Return True when the registered staff section allows Friday-Sunday attendance."""
+        try:
+            section = str(self.current_user[16] if self.current_user and len(self.current_user) > 16 else "").strip().upper()
+            return section in self.WEEKEND_ATTENDANCE_SECTIONS
+        except Exception:
+            return False
+
+    def _is_attendance_working_day(self, date_obj=None):
+        """Attendance capture rules:
+        - Information Management, HR and Security: Monday-Sunday.
+        - Every other section: Monday-Thursday only.
+        Friday remains available in the timesheet for all staff.
         """
         date_obj = date_obj or datetime.now()
+        if self._staff_can_attend_weekends():
+            return True
         return date_obj.weekday() in (0, 1, 2, 3)
 
     def _block_attendance_non_working_day(self, action_name='Attendance'):
         now = datetime.now()
         if self._is_attendance_working_day(now):
             return False
-        if now.weekday() == 4:
-            title = f"{action_name} Unavailable - Friday WFH"
-            message = ("Friday is Work From Home (WFH).\n\n"
-                       "Check-In and Check-Out are not captured on Friday. "
-                       "Friday remains included in the Timesheet.")
-        else:
-            title = f"{action_name} Unavailable"
-            message = ("Attendance can only be captured Monday to Thursday.\n\n"
-                       "Friday is Work From Home, while Saturday and Sunday are non-working days.")
+        title = f"{action_name} Unavailable"
+        message = ("This section can only capture attendance Monday to Thursday.\n\n"
+                   "Information Management, HR and Security are permitted to check in and check out Friday, Saturday and Sunday.")
         dialog = MDDialog(title=title, text=message,
                           buttons=[MDFlatButton(text="OK", on_release=lambda x: dialog.dismiss())])
         dialog.open()
@@ -4501,7 +4842,7 @@ class ROHIAttendanceApp(MDApp):
             req = Request(endpoint, data=body, method="POST")
             req.add_header("Content-Type", "application/json; charset=utf-8")
             req.add_header("User-Agent", "ROHI-Attendance-App/2.0")
-            with urlopen(req, timeout=timeout) as response:
+            with urlopen(req, timeout=timeout, context=ROHI_SSL_CONTEXT) as response:
                 status = getattr(response, "status", 200)
                 raw = response.read(8192).decode("utf-8", errors="replace")
             if status < 200 or status >= 300:
