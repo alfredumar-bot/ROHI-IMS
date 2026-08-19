@@ -371,17 +371,6 @@
                             size_hint_y: None
                             height: dp(64)
 
-                        MDTextField:
-                            id: rohi_shared_secret_field
-                            hint_text: "Shared Secret (must match CONFIG.sharedSecret in the Apps Script)"
-                            password: True
-
-                        MDRaisedButton:
-                            text: "SAVE SHARED SECRET"
-                            size_hint_x: 1
-                            md_bg_color: 0.4, 0.4, 0.4, 1
-                            on_release: app.save_rohi_shared_secret()
-
                         MDLabel:
                             id: excel_sync_result_label
                             text: "Links are preloaded from the supplied auto-sync workbook."

@@ -50,8 +50,14 @@ REPORT_EXPORT_PASSWORD = "Rohi@3313@"
 # -------------------------------------------------------------
 REMINDER_CHECKIN_HOUR, REMINDER_CHECKIN_MINUTE = 7, 50
 REMINDER_CHECKOUT_HOUR, REMINDER_CHECKOUT_MINUTE = 15, 50
-REMINDER_REPEAT_MINUTES = 5     # gap between nudges
-REMINDER_REPEAT_COUNT = 3       # extra nudges fired after the on-time one
+# Check-in nudges fire at exact clock times: 07:50 (first), 07:55 (second),
+# 07:59 (third/last) - expressed as minutes after REMINDER_CHECKIN_MINUTE.
+CHECKIN_REMINDER_OFFSETS_MINUTES = [0, 5, 9]
+REMINDER_REPEAT_MINUTES = 5     # gap between check-out nudges
+REMINDER_REPEAT_COUNT = 3       # extra check-out nudges fired after the on-time one
+CHECKOUT_REMINDER_OFFSETS_MINUTES = [
+    slot * REMINDER_REPEAT_MINUTES for slot in range(0, REMINDER_REPEAT_COUNT + 1)
+]
 
 # How often (seconds) the background auto-sync timer pushes pending rows to
 # the PostgreSQL server without the user pressing "Synchronize Now".
@@ -117,20 +123,6 @@ def _save_excel_sync_config(data):
         return False
 
 
-def _load_rohi_shared_secret_for_upload():
-    """Module-level helper mirroring App._load_rohi_shared_secret, since
-    _http_upload_excel runs without access to the App instance."""
-    try:
-        path = os.path.join(APP_DIR, "app_settings.json")
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return str(data.get("rohi_shared_secret", ""))
-    except Exception:
-        logger.exception("Failed to load shared secret for upload.")
-    return ""
-
-
 def _http_upload_excel(filepath, endpoint, report_type):
     """Upload an XLSX file to a configured server/Apps-Script endpoint.
 
@@ -156,7 +148,6 @@ def _http_upload_excel(filepath, endpoint, report_type):
                 "report_type": report_type,
                 "filename": filename,
                 "file_base64": payload,
-                "secret": _load_rohi_shared_secret_for_upload(),
             }).encode("utf-8")
             req = Request(endpoint, data=body, method="POST")
             req.add_header("Content-Type", "application/json")
@@ -501,13 +492,11 @@ class ROHIAttendanceApp(MDApp):
         self.server_connection_screen = sm.get_screen("server_connection")
 
         Clock.schedule_once(self._restore_or_open_login, 1.2)
-        # Excel report generation/upload is now on-demand only: it runs when
-        # the user presses an Export/Send button (or "Push All Reports"), not
-        # automatically in the background. This avoids the app repeatedly
-        # regenerating workbooks and uploading them on a timer, which cost
-        # both battery/CPU and made the UI feel slower. Attendance/profile
-        # data itself still syncs quietly via _auto_sync_tick below, since
-        # that pushes structured data directly (no file export involved).
+        # Excel mirror jobs: staff corrections are checked once every 24 hours;
+        # attendance is mirrored at 5:00 PM each day. The check also runs after
+        # app launch so a phone that was offline at 5 PM catches up later.
+        Clock.schedule_once(lambda dt: self._excel_sync_schedule_tick(), 3)
+        Clock.schedule_interval(lambda dt: self._excel_sync_schedule_tick(), 30)
 
         # Run the live dashboard clock app-wide from launch (not tied to login),
         # so it's never stuck on the "Loading Date & Time..." placeholder.
@@ -529,7 +518,27 @@ class ROHIAttendanceApp(MDApp):
         in kv/registration.kv. (Previously this also bound duplicate on_touch_down
         handlers here, which could double-trigger a menu open on a single tap and
         occasionally left the wrong field focused/populated - removed for that reason.)"""
-        pass
+        self._start_background_reminder_service()
+
+    def _start_background_reminder_service(self):
+        """Starts the ServiceReminder Android service (service_reminder.py) so
+        the 07:50/07:55/07:59 (and 15:50-series) reminders still fire even
+        while the app is closed or the screen is off - the in-app Clock-based
+        _reminder_tick only runs while this app is actually in the foreground.
+        No-op (silently) on desktop or if anything about the service API is
+        unavailable, so it can never crash app startup."""
+        if platform != "android":
+            return
+        try:
+            from jnius import autoclass
+            package_name = "org.rohi.rohiattendance"  # buildozer.spec: package.domain + package.name
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            ServiceReminder = autoclass("{}.ServiceReminder".format(package_name))
+            ServiceReminder.start(PythonActivity.mActivity, "")
+            self._reminder_service = ServiceReminder
+            logger.info("Background reminder service started.")
+        except Exception:
+            logger.exception("Could not start background reminder service; falling back to in-app reminders only.")
 
     def _dismiss_active_menu(self):
         if self.active_menu:
@@ -542,6 +551,54 @@ class ROHIAttendanceApp(MDApp):
     def _app_settings_path(self):
         return os.path.join(os.path.dirname(__file__), "app_settings.json")
 
+    def _load_reminders_enabled(self):
+        try:
+            path = self._app_settings_path()
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return bool(data.get("reminders_enabled", True))
+        except Exception:
+            logger.exception("Failed to load app_settings.json; defaulting reminders to ON.")
+        return True
+
+    def _save_reminders_enabled(self, enabled):
+        try:
+            path = self._app_settings_path()
+            data = {}
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            data["reminders_enabled"] = bool(enabled)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            logger.exception("Failed to save reminder notification preference:")
+
+    def toggle_reminder_notifications(self, enabled):
+        """Bound to the Attendance Reminder Notifications switch in Settings.
+        Also read by service_reminder.py (the background service) so turning
+        this off silences both the in-app and background reminders."""
+        self._save_reminders_enabled(enabled)
+
+    def open_notification_settings(self):
+        """Bound to 'Open Notification Settings' in Settings - jumps straight
+        to this app's Android system notification settings page, so the user
+        can control sound/vibration/banner style at the OS level."""
+        if platform != "android":
+            return
+        try:
+            from jnius import autoclass
+            Intent = autoclass("android.content.Intent")
+            Settings = autoclass("android.provider.Settings")
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            activity = PythonActivity.mActivity
+            intent = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+            intent.putExtra(Settings.EXTRA_APP_PACKAGE, activity.getPackageName())
+            activity.startActivity(intent)
+        except Exception:
+            logger.exception("Could not open Android notification settings:")
+
     def _load_geofence_radius(self):
         try:
             path = self._app_settings_path()
@@ -552,39 +609,6 @@ class ROHIAttendanceApp(MDApp):
         except Exception:
             logger.exception("Failed to load app_settings.json; using default geofence radius.")
         return 100
-
-    def _load_rohi_shared_secret(self):
-        try:
-            path = self._app_settings_path()
-            if os.path.exists(path):
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                return str(data.get("rohi_shared_secret", ""))
-        except Exception:
-            logger.exception("Failed to load app_settings.json; using empty shared secret.")
-        return ""
-
-    def save_rohi_shared_secret(self):
-        """Persists the shared secret typed into Server Connection. This same
-        value must be set in google_drive_upload.gs's CONFIG.sharedSecret -
-        the Apps Script rejects any request that doesn't include it, which is
-        what stops someone who merely has the /exec URL from being able to
-        submit or overwrite data."""
-        ids = self.server_connection_screen.ids
-        secret = ids.rohi_shared_secret_field.text.strip() if hasattr(ids, 'rohi_shared_secret_field') else ""
-        try:
-            path = self._app_settings_path()
-            data = {}
-            if os.path.exists(path):
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            data["rohi_shared_secret"] = secret
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(data, f)
-            self._set_sync_result_label("Shared secret saved.", ok=True)
-        except Exception:
-            logger.exception("Failed to save shared secret:")
-            self._set_sync_result_label("Could not save shared secret.", ok=False)
 
     def _load_google_form_url(self):
         try:
@@ -737,6 +761,8 @@ class ROHIAttendanceApp(MDApp):
                 lbl.text = f"{state} · {status['pending_count']} record(s) pending sync"
                 lbl.theme_text_color = "Custom"
                 lbl.text_color = (0.1, 0.6, 0.2, 1) if status["connected"] else (0.6, 0.15, 0.15, 1)
+            if "reminders_switch" in self.settings_screen.ids:
+                self.settings_screen.ids.reminders_switch.active = self._load_reminders_enabled()
         self.root.current = "settings"
 
     def open_server_connection(self):
@@ -775,9 +801,6 @@ class ROHIAttendanceApp(MDApp):
 
         if "google_form_url_field" in ids:
             ids.google_form_url_field.text = self._load_google_form_url()
-
-        if "rohi_shared_secret_field" in ids:
-            ids.rohi_shared_secret_field.text = self._load_rohi_shared_secret()
         self._load_google_form_auto_sync_status()
         self._refresh_excel_sync_fields()
 
@@ -2226,6 +2249,8 @@ class ROHIAttendanceApp(MDApp):
             now = datetime.now()
             if not self.current_user:
                 return
+            if not self._load_reminders_enabled():
+                return
             if not self._is_attendance_working_day(now):
                 return
             self._reminder_reset_if_new_day(now.date())
@@ -2235,36 +2260,39 @@ class ROHIAttendanceApp(MDApp):
             checked_out = bool(row and row[1])
 
             self._maybe_fire_reminder(
-                "checkin", now, REMINDER_CHECKIN_HOUR, REMINDER_CHECKIN_MINUTE, checked_in
+                "checkin", now, REMINDER_CHECKIN_HOUR, REMINDER_CHECKIN_MINUTE,
+                checked_in, CHECKIN_REMINDER_OFFSETS_MINUTES
             )
             self._maybe_fire_reminder(
-                "checkout", now, REMINDER_CHECKOUT_HOUR, REMINDER_CHECKOUT_MINUTE, checked_out
+                "checkout", now, REMINDER_CHECKOUT_HOUR, REMINDER_CHECKOUT_MINUTE,
+                checked_out, CHECKOUT_REMINDER_OFFSETS_MINUTES
             )
         except Exception:
             logger.exception("Reminder tick failed:")
 
-    def _maybe_fire_reminder(self, kind, now, hour, minute, already_done):
+    def _maybe_fire_reminder(self, kind, now, hour, minute, already_done, offsets_minutes):
         if already_done:
             return
         base_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
         fired = self._reminder_state[kind]
-        for slot in range(0, REMINDER_REPEAT_COUNT + 1):  # 0 = on-time, 1..N = nudges
+        last_slot = len(offsets_minutes) - 1
+        for slot, offset in enumerate(offsets_minutes):  # 0 = on-time, 1..N = nudges
             if slot in fired:
                 continue
-            slot_time = base_time + timedelta(minutes=slot * REMINDER_REPEAT_MINUTES)
+            slot_time = base_time + timedelta(minutes=offset)
             if now >= slot_time:
                 fired.add(slot)
-                self._send_reminder_notification(kind, slot)
+                self._send_reminder_notification(kind, slot, last_slot)
 
     @staticmethod
-    def _send_reminder_notification(kind, slot):
+    def _send_reminder_notification(kind, slot, last_slot):
         label = "Check-In" if kind == "checkin" else "Check-Out"
         verb = "checked in" if kind == "checkin" else "checked out"
         if slot == 0:
             title = f"ROHI {label} Reminder"
             message = f"It's time to {label.lower()}. Open ROHI Attendance and tap {label}."
         else:
-            title = f"ROHI {label} Reminder ({slot}/{REMINDER_REPEAT_COUNT})"
+            title = f"ROHI {label} Reminder ({slot}/{last_slot})"
             message = f"You still haven't {verb} today. Please do so now."
         try:
             from plyer import notification as plyer_notification
@@ -2788,10 +2816,9 @@ class ROHIAttendanceApp(MDApp):
         self._dismiss_active_menu()
         dept = self.registration_screen.ids.department.text if hasattr(self.registration_screen.ids, 'department') else ""
         if dept == "Programs":
-            sectors = ["MEAL", "PROTECTION", "EDUCATION", "LIVELIHOOD", "WASH", "NUTRITION", "GBV",
-                       "COMMUNICATION", "Information Management"]
+            sectors = ["MEAL", "PROTECTION", "EDUCATION", "LIVELIHOOD", "WASH", "NUTRITION", "GBV", "COMMUNICATION", "INFORMATION MANAGEMENT"]
         elif dept == "HR & Operation":
-            sectors = ["HR", "LOGISTIC", "MAINTENANCE"]
+            sectors = ["HR", "LOGISTIC", "MAINTENANCE", "SECURITY"]
         elif dept == "Finance":
             sectors = ["Finance"]
         else:
@@ -2888,6 +2915,32 @@ class ROHIAttendanceApp(MDApp):
             return
         self._gallery_target = target
         try:
+            # On a lot of devices the *first* tap only triggers Android's
+            # storage-permission prompt in the background (no chooser
+            # visibly opens), so the picker only actually shows up on the
+            # second tap once permission is already granted. Request the
+            # permission up front and open the chooser as soon as we get an
+            # answer (granted or not - Storage Access Framework picking
+            # generally still works either way), so one tap is enough.
+            from android.permissions import request_permissions, Permission, check_permission
+            needed = [Permission.READ_EXTERNAL_STORAGE]
+            media_images = getattr(Permission, "READ_MEDIA_IMAGES", None)
+            if media_images:
+                needed.append(media_images)
+            if all(check_permission(p) for p in needed):
+                self._launch_filechooser()
+            else:
+                def _on_permission_result(permissions, grants):
+                    Clock.schedule_once(lambda dt: self._launch_filechooser(), 0)
+                request_permissions(needed, _on_permission_result)
+        except Exception:
+            # android.permissions unavailable - fall back to opening the
+            # chooser directly, same as before.
+            self._launch_filechooser()
+
+    def _launch_filechooser(self):
+        target = getattr(self, '_gallery_target', 'photo')
+        try:
             from plyer import filechooser
             filechooser.open_file(
                 on_selection=self._on_filechooser_selection,
@@ -2980,42 +3033,25 @@ class ROHIAttendanceApp(MDApp):
 
             activity = autoclass('org.kivy.android.PythonActivity').mActivity
             resolver = activity.getContentResolver()
-
-            # Decode at (roughly) the target resolution directly, instead of
-            # decoding the full-resolution original (a 12MP phone photo is
-            # ~48MB of raw pixels) and only downscaling afterwards. This is
-            # what was making gallery/signature picks slow and memory-heavy.
-            BitmapFactory = autoclass('android.graphics.BitmapFactory')
-            BitmapFactoryOptions = autoclass('android.graphics.BitmapFactory$Options')
-            ByteArrayOutputStream = autoclass('java.io.ByteArrayOutputStream')
-            CompressFormat = autoclass('android.graphics.Bitmap$CompressFormat')
-            max_side = 1200
-
-            bounds_stream = resolver.openInputStream(uri)
-            if bounds_stream is None:
-                raise RuntimeError("Unable to read the selected gallery image.")
-            bounds_opts = BitmapFactoryOptions()
-            bounds_opts.inJustDecodeBounds = True
-            BitmapFactory.decodeStream(bounds_stream, None, bounds_opts)
-            bounds_stream.close()
-            orig_w, orig_h = int(bounds_opts.outWidth), int(bounds_opts.outHeight)
-
-            sample_size = 1
-            if orig_w > 0 and orig_h > 0:
-                while (orig_w // (sample_size * 2)) >= max_side or (orig_h // (sample_size * 2)) >= max_side:
-                    sample_size *= 2
-
             input_stream = resolver.openInputStream(uri)
             if input_stream is None:
                 raise RuntimeError("Unable to read the selected gallery image.")
-            decode_opts = BitmapFactoryOptions()
-            decode_opts.inSampleSize = sample_size
-            bitmap = BitmapFactory.decodeStream(input_stream, None, decode_opts)
+
+            # Decode via Android's own Bitmap decoder and re-encode to JPEG
+            # bytes, rather than manually copying the InputStream into a
+            # Python bytearray - pyjnius does not reliably copy Java's writes
+            # into a Python-side bytearray passed as a byte[] argument, which
+            # was silently producing empty/corrupt image files.
+            BitmapFactory = autoclass('android.graphics.BitmapFactory')
+            ByteArrayOutputStream = autoclass('java.io.ByteArrayOutputStream')
+            CompressFormat = autoclass('android.graphics.Bitmap$CompressFormat')
+            bitmap = BitmapFactory.decodeStream(input_stream)
             input_stream.close()
             if bitmap is None:
                 raise RuntimeError("The selected file could not be read as an image.")
-            # inSampleSize only gives powers-of-2 approximations, so still
-            # do a final precise scale down to max_side.
+            # Downscale large phone photos/signatures before storing them. This
+            # keeps the app responsive and prevents huge Excel exports.
+            max_side = 1200
             bw, bh = int(bitmap.getWidth()), int(bitmap.getHeight())
             if max(bw, bh) > max_side:
                 scale = max_side / float(max(bw, bh))
@@ -3815,9 +3851,13 @@ class ROHIAttendanceApp(MDApp):
         self._last_export_path = filepath
         return filepath
 
-    def _export_attendance_template(self, rows, title_suffix="Selected"):
-        """Export attendance using the uploaded attendance workbook template."""
-        reports_dir = self._get_download_dir()
+    def _export_attendance_template(self, rows, title_suffix="Selected", directory=None):
+        """Export attendance using the uploaded attendance workbook template.
+
+        ``directory`` lets a caller build the workbook somewhere other than
+        the visible phone Downloads folder (used for "Send to Google" so it
+        never has to write to Downloads or touch the export status)."""
+        reports_dir = directory or self._get_download_dir()
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filepath = os.path.join(reports_dir, f"Rohi_Attendance_Report_{_safe_filename(title_suffix)}_{timestamp}.xlsx")
         self._copy_template("Rohi_Attendance Report.xlsx", filepath)
@@ -3844,13 +3884,19 @@ class ROHIAttendanceApp(MDApp):
             self._encrypt_xlsx_open_password(filepath, REPORT_EXPORT_PASSWORD)
         except Exception:
             logger.exception("Could not password-protect attendance template export.")
-        self._last_export_path = filepath
+        if directory is None:
+            self._last_export_path = filepath
         return filepath
 
-    def _export_timesheet_template(self, for_sync=False):
+    def _export_timesheet_template(self, for_sync=False, directory=None):
         """Populate the exact uploaded Corrected Timesheet.xlsx template.
         Column widths, row heights, logo, thick/thin borders and merged cells
-        remain from the supplied workbook."""
+        remain from the supplied workbook.
+
+        ``directory`` lets a caller build the workbook somewhere other than
+        the visible phone Downloads folder (e.g. a private temp folder used
+        only to build a file for "Send to Google", without ever writing to
+        Downloads or touching the on-screen export status)."""
         rows = getattr(self, "_last_timesheet_rows", [])
         if not rows:
             return None
@@ -3864,7 +3910,7 @@ class ROHIAttendanceApp(MDApp):
         state_office = str(user[13]) if user and len(user) > 13 and user[13] else "-"
         nationality = str(user[6]) if user and len(user) > 6 and user[6] else "-"
 
-        reports_dir = self._get_download_dir()
+        reports_dir = directory or self._get_download_dir()
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         if for_sync:
             filename = f"ROHI_Timesheet_AutoSync_{_safe_filename(fullname)}_{month_name}_{year}.xlsx"
@@ -3916,7 +3962,8 @@ class ROHIAttendanceApp(MDApp):
         ws["A46"] = "Employee Signature: ____________________________"
         ws["A49"] = "Supervisor Signature: ____________________________"
         wb.save(filepath)
-        self._last_export_path = filepath
+        if directory is None:
+            self._last_export_path = filepath
         return filepath
 
     def _build_excel(self, filepath, headers, data_rows, sheet_title="Report", password=None):
@@ -4049,6 +4096,22 @@ class ROHIAttendanceApp(MDApp):
 
         os.makedirs(download_dir, exist_ok=True)
         return download_dir
+
+    def _get_temp_sync_dir(self):
+        """Private, hidden folder used only to build a workbook in memory-like
+        fashion for "Send to Google". Never the phone's visible Downloads
+        folder, and never surfaced to the user - it's deleted right after
+        the upload finishes either way."""
+        temp_dir = os.path.join(self.user_data_dir, "temp_send_to_google")
+        os.makedirs(temp_dir, exist_ok=True)
+        return temp_dir
+
+    def _cleanup_temp_sync_file(self, filepath):
+        try:
+            if filepath and os.path.exists(filepath) and self._get_temp_sync_dir() in filepath:
+                os.remove(filepath)
+        except Exception:
+            logger.exception("Could not remove temporary send-to-Google file.")
 
     def _show_report_status(self, message):
         if hasattr(self, 'reports_screen') and hasattr(self.reports_screen.ids, 'report_status_label'):
@@ -4374,8 +4437,14 @@ class ROHIAttendanceApp(MDApp):
             logger.exception("Leave request submission failed")
             ids.leave_message.text = f"Could not submit request: {exc}"
 
-    def export_leave_excel(self):
-        """Export the logged-in staff member's leave history and balances to Excel."""
+    def export_leave_excel(self, directory=None, silent=False):
+        """Export the logged-in staff member's leave history and balances to Excel.
+
+        ``directory`` lets a caller build the workbook somewhere other than
+        the visible phone Downloads folder. ``silent`` skips updating the
+        on-screen export status and the auto-sync queue — used when this is
+        only building a temporary file for "Send to Google", not a real
+        export the user asked to keep."""
         try:
             if not self.current_user:
                 return None
@@ -4397,7 +4466,7 @@ class ROHIAttendanceApp(MDApp):
             if not data_rows:
                 data_rows.append(["No leave requests", "-", "-", 0, "-", "-", "-", "-"])
 
-            reports_dir = self._get_download_dir()
+            reports_dir = directory or self._get_download_dir()
             fullname = str(self.current_user[1]).replace(" ", "_") if len(self.current_user) > 1 else "staff"
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filepath = os.path.join(reports_dir, f"Leave_Report_{fullname}_{timestamp}.xlsx")
@@ -4405,6 +4474,8 @@ class ROHIAttendanceApp(MDApp):
                 filepath, headers, data_rows,
                 sheet_title="Leave Management", password=REPORT_EXPORT_PASSWORD
             )
+            if silent:
+                return filepath
             self._last_export_path = filepath
             self._queue_excel_auto_sync(filepath, "leave")
             if hasattr(self.leave_screen.ids, 'leave_message'):
@@ -4413,7 +4484,7 @@ class ROHIAttendanceApp(MDApp):
             return filepath
         except Exception as exc:
             logger.exception("Error exporting leave report")
-            if hasattr(self.leave_screen.ids, 'leave_message'):
+            if not silent and hasattr(self.leave_screen.ids, 'leave_message'):
                 self.leave_screen.ids.leave_message.text = f"Could not export leave report: {exc}"
             return None
 
@@ -4426,8 +4497,6 @@ class ROHIAttendanceApp(MDApp):
         if not endpoint:
             return False, "No automatic upload endpoint configured."
         try:
-            payload = dict(payload or {})
-            payload["secret"] = self._load_rohi_shared_secret()
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             req = Request(endpoint, data=body, method="POST")
             req.add_header("Content-Type", "application/json; charset=utf-8")
@@ -4513,7 +4582,7 @@ class ROHIAttendanceApp(MDApp):
                 self._set_staff_registration_sync_status(message, False)
         threading.Thread(target=worker, daemon=True).start()
 
-    def _send_excel_now(self, filepath, report_type, status_callback=None):
+    def _send_excel_now(self, filepath, report_type, status_callback=None, cleanup_path=None):
         """Send a generated workbook immediately.
 
         If an actual HTTP/Apps-Script upload endpoint is configured, the XLSX
@@ -4522,6 +4591,10 @@ class ROHIAttendanceApp(MDApp):
         "Not Connected". A share/folder URL cannot itself receive an XLSX POST,
         so the UI clearly tells the user that an upload endpoint is still needed
         for true unattended file transfer.
+
+        ``cleanup_path``, when given, is deleted once the upload attempt
+        finishes (used for the private temp file built just for "Send to
+        Google" so nothing is left behind on the phone).
         """
         if not filepath or not os.path.exists(filepath):
             message = "Generate the Excel file first."
@@ -4544,6 +4617,8 @@ class ROHIAttendanceApp(MDApp):
             )
             if status_callback:
                 Clock.schedule_once(lambda dt: status_callback(message, False), 0)
+            if cleanup_path:
+                self._cleanup_temp_sync_file(cleanup_path)
             return False
 
         def worker():
@@ -4553,6 +4628,8 @@ class ROHIAttendanceApp(MDApp):
                 _save_excel_sync_config(self._excel_sync_state)
             if status_callback:
                 Clock.schedule_once(lambda dt: status_callback(message, ok), 0)
+            if cleanup_path:
+                self._cleanup_temp_sync_file(cleanup_path)
         threading.Thread(target=worker, daemon=True).start()
         return True
 
@@ -4565,13 +4642,86 @@ class ROHIAttendanceApp(MDApp):
         except Exception:
             pass
 
+    def _build_selected_report_for_sync(self):
+        """Build the currently-selected report type (Attendance - Selected
+        Period / Full History / Staff Registration) straight into a private
+        temp folder, without ever touching the visible Downloads folder or
+        the on-screen export status. Used only by "Send to Google" so it can
+        send immediately without the user pressing "Generate Report" first."""
+        if not self.current_user:
+            return None
+        ids = self.reports_screen.ids
+        label = ids.report_type_field.text.strip() if hasattr(ids, 'report_type_field') else ""
+        type_map = dict(self.REPORT_TYPE_OPTIONS)
+        report_type = type_map.get(label) or "attendance"
+
+        temp_dir = self._get_temp_sync_dir()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fullname_safe = str(self.current_user[1]).replace(" ", "_") if len(self.current_user) > 1 else "staff"
+
+        if report_type == "staff_registration":
+            # No temp-only variant exists for the staff template export; it
+            # always writes its own filename, so build straight into temp_dir.
+            filepath = os.path.join(temp_dir, f"ROHI_Staff_on_IMS_{timestamp}.xlsx")
+            self._copy_template("Rohi_Staff on IMS.xlsx", filepath)
+            wb = openpyxl.load_workbook(filepath)
+            ws = wb.active
+            headers, data_rows = self._staff_registration_headers_and_rows()
+            template_headers = [ws.cell(3, c).value for c in range(1, ws.max_column + 1)]
+            index_map = {str(h).strip().lower(): i for i, h in enumerate(headers)}
+            for r in range(4, ws.max_row + 1):
+                for c in range(1, ws.max_column + 1):
+                    ws.cell(r, c).value = None
+            from copy import copy as _copy
+            template_row_height = ws.row_dimensions[4].height
+            template_styles = {c: _copy(ws.cell(4, c)._style) for c in range(1, ws.max_column + 1)}
+            template_alignment = {c: _copy(ws.cell(4, c).alignment) for c in range(1, ws.max_column + 1)}
+            template_number_formats = {c: ws.cell(4, c).number_format for c in range(1, ws.max_column + 1)}
+            for r_idx, row in enumerate(data_rows, start=4):
+                if r_idx > ws.max_row:
+                    ws.insert_rows(r_idx)
+                if template_row_height is not None:
+                    ws.row_dimensions[r_idx].height = template_row_height
+                for c_idx, h in enumerate(template_headers, start=1):
+                    cell = ws.cell(r_idx, c_idx)
+                    if r_idx > 4:
+                        cell._style = _copy(template_styles.get(c_idx))
+                        cell.alignment = _copy(template_alignment.get(c_idx))
+                        cell.number_format = template_number_formats.get(c_idx, "General")
+                    pos = index_map.get(str(h).strip().lower())
+                    cell.value = row[pos] if pos is not None and pos < len(row) else "-"
+            wb.save(filepath)
+            try:
+                self._encrypt_xlsx_open_password(filepath, REPORT_EXPORT_PASSWORD)
+            except Exception:
+                logger.exception("Could not password-protect staff template export.")
+            return filepath
+        elif report_type == "attendance_history":
+            email_val = str(self.current_user[20]) if len(self.current_user) > 20 else ""
+            rows = self._fetch_attendance_records(email_val)
+            return self._export_attendance_template(rows, title_suffix="Full_History", directory=temp_dir)
+        else:  # "attendance" - currently selected report period
+            rows = getattr(self, '_last_report_rows', [])
+            return self._export_attendance_template(rows, title_suffix="Selected", directory=temp_dir)
+
     def send_attendance_report_to_excel(self):
-        """Generate the selected attendance workbook if necessary, then send it immediately."""
-        path = getattr(self, "_last_export_path", None)
-        if not path or not os.path.exists(path) or "attendance" not in os.path.basename(path).lower():
-            self.generate_selected_report()
-            path = getattr(self, "_last_export_path", None)
-        self._send_excel_now(path, "attendance", self._set_report_send_status)
+        """Send a fresh attendance workbook straight to Google.
+
+        This does not require "Generate Report" to be pressed first, and it
+        does not run the export flow in the background either — it builds
+        the workbook privately just for this upload, sends it, then removes
+        the temp file. "Generate Report" still works exactly as before for
+        anyone who wants the file saved to their phone.
+        """
+        try:
+            path = self._build_selected_report_for_sync()
+        except Exception:
+            logger.exception("Could not build attendance report for Send to Google.")
+            path = None
+        if not path or not os.path.exists(path):
+            self._set_report_send_status("Could not build the report to send.", False)
+            return
+        self._send_excel_now(path, "attendance", self._set_report_send_status, cleanup_path=path)
 
     @mainthread
     def _set_timesheet_send_status(self, message, ok=True):
@@ -4583,10 +4733,24 @@ class ROHIAttendanceApp(MDApp):
             pass
 
     def send_timesheet_to_excel(self):
-        path = getattr(self, "_last_export_path", None)
-        if not path or not os.path.exists(path) or "timesheet" not in os.path.basename(path).lower():
-            path = self.export_timesheet_excel()
-        self._send_excel_now(path, "timesheet", self._set_timesheet_send_status)
+        """Send a fresh timesheet workbook straight to Google.
+
+        This does not require "Export Timesheet (Excel)" to be pressed
+        first, and it does not run the export flow in the background
+        either — it builds the workbook privately just for this upload,
+        sends it, then removes the temp file. The export button still
+        works exactly as before for anyone who wants the file saved to
+        their phone.
+        """
+        try:
+            path = self._export_timesheet_template(directory=self._get_temp_sync_dir())
+        except Exception:
+            logger.exception("Could not build timesheet for Send to Google.")
+            path = None
+        if not path or not os.path.exists(path):
+            self._set_timesheet_send_status("Could not build the timesheet to send.", False)
+            return
+        self._send_excel_now(path, "timesheet", self._set_timesheet_send_status, cleanup_path=path)
 
     @mainthread
     def _set_leave_send_status(self, message, ok=True):
@@ -4598,10 +4762,24 @@ class ROHIAttendanceApp(MDApp):
             pass
 
     def send_leave_to_excel(self):
-        path = getattr(self, "_last_export_path", None)
-        if not path or not os.path.exists(path) or "leave_report" not in os.path.basename(path).lower():
-            path = self.export_leave_excel()
-        self._send_excel_now(path, "leave", self._set_leave_send_status)
+        """Send a fresh leave report workbook straight to Google.
+
+        This does not require "Export Leave Report (Excel)" to be pressed
+        first, and it does not run the export flow in the background
+        either — it builds the workbook privately just for this upload,
+        sends it, then removes the temp file. The export button still
+        works exactly as before for anyone who wants the file saved to
+        their phone.
+        """
+        try:
+            path = self.export_leave_excel(directory=self._get_temp_sync_dir(), silent=True)
+        except Exception:
+            logger.exception("Could not build leave report for Send to Google.")
+            path = None
+        if not path or not os.path.exists(path):
+            self._set_leave_send_status("Could not build the leave report to send.", False)
+            return
+        self._send_excel_now(path, "leave", self._set_leave_send_status, cleanup_path=path)
 
     def _queue_excel_auto_sync(self, filepath, report_type):
         """Send an exported workbook to the configured server endpoint without
@@ -4747,9 +4925,8 @@ class ROHIAttendanceApp(MDApp):
     def push_all_reports_now(self):
         """Immediately generate and queue all configured report workbooks.
 
-        Report exports are on-demand only - this button (and the individual
-        Export/Send buttons on each report screen) are the only things that
-        generate and upload a workbook.
+        The normal 3-minute auto-sync scheduler remains active. This button is
+        simply an on-demand push and never disables the scheduler.
         """
         if not self.current_user:
             logger.warning("Immediate report push requested without an authenticated user.")
@@ -4778,7 +4955,7 @@ class ROHIAttendanceApp(MDApp):
                 except Exception as exc:
                     logger.exception("Immediate %s report push failed", name)
                     results.append(f"{name}: failed")
-            message = "All reports pushed/queued."
+            message = "All reports pushed/queued. Auto-sync remains every 3 minutes."
             Clock.schedule_once(lambda dt: self._finish_push_all_reports(message), 0)
 
         threading.Thread(target=worker, daemon=True).start()
@@ -4793,6 +4970,44 @@ class ROHIAttendanceApp(MDApp):
                 self.dashboard_screen.ids.push_reports_status.text = message
         except Exception:
             pass
+
+    def _excel_sync_schedule_tick(self):
+        """Run all Excel auto-sync jobs every 3 minutes while a user is logged in.
+
+        The 30-second scheduler tick only checks whether each 180-second job is due;
+        the actual Excel generation/upload runs in background threads so the UI stays responsive.
+        """
+        try:
+            if not self.current_user:
+                return
+            now = datetime.now()
+
+            def due(key, interval):
+                last = str(self._excel_sync_state.get(key) or "")
+                if not last:
+                    return True
+                try:
+                    return (now - datetime.fromisoformat(last)).total_seconds() >= interval
+                except Exception:
+                    return True
+
+            if due("last_staff_sync", STAFF_EXCEL_SYNC_INTERVAL_SECONDS) and not self._excel_staff_schedule_running:
+                self._excel_staff_schedule_running = True
+                threading.Thread(target=self._generate_staff_excel_for_sync, daemon=True).start()
+
+            if due("last_timesheet_sync", TIMESHEET_EXCEL_SYNC_INTERVAL_SECONDS) and not self._excel_timesheet_schedule_running:
+                self._excel_timesheet_schedule_running = True
+                threading.Thread(target=self._generate_timesheet_excel_for_sync, daemon=True).start()
+
+            if due("last_attendance_sync", ATTENDANCE_EXCEL_SYNC_INTERVAL_SECONDS) and not self._excel_attendance_schedule_running:
+                self._excel_attendance_schedule_running = True
+                threading.Thread(target=self._generate_attendance_excel_for_sync, daemon=True).start()
+
+            if due("last_leave_sync", LEAVE_EXCEL_SYNC_INTERVAL_SECONDS) and not self._excel_leave_schedule_running:
+                self._excel_leave_schedule_running = True
+                threading.Thread(target=self._generate_leave_excel_for_sync, daemon=True).start()
+        except Exception:
+            logger.exception("Excel sync scheduler tick failed.")
 
     # -----------------------------
     # Timesheet (Excel export + signature upload)

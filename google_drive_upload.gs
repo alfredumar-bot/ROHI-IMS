@@ -27,14 +27,6 @@ The same /exec URL can be used in all four endpoint fields.
 */
 
 const CONFIG = {
-  // Shared secret: the Android app must send this exact value in every
-  // request. Without it, doPost() rejects the request before touching any
-  // spreadsheet or Drive folder - this is what stops someone who merely
-  // obtains the /exec URL from being able to submit or overwrite data.
-  // Change this to your own random string, then put the SAME string into
-  // the app's Server Connection screen (Shared Secret field).
-  sharedSecret: 'CHANGE_ME_TO_A_LONG_RANDOM_STRING',
-
   driveFolders: {
     attendance: '', // optional folder for generated attendance XLSX
     timesheet: '1GTYacKygoa9O9vH_Oo--ZVZtCijKrEfD',
@@ -73,20 +65,6 @@ function doPost(e) {
     }
 
     const data = JSON.parse(e.postData.contents);
-
-    // Reject any request that doesn't include the correct shared secret,
-    // before it can touch a spreadsheet or Drive folder. This is what
-    // prevents someone who only has the /exec URL (which isn't otherwise
-    // secret - it's stored in the app and this file) from submitting or
-    // overwriting data.
-    const providedSecret = String(data.secret || '');
-    if (!CONFIG.sharedSecret || CONFIG.sharedSecret === 'CHANGE_ME_TO_A_LONG_RANDOM_STRING') {
-      return json_({ok:false, message:'Server is not configured with a shared secret yet. Set CONFIG.sharedSecret in this script.'});
-    }
-    if (providedSecret !== CONFIG.sharedSecret) {
-      return json_({ok:false, message:'Unauthorized: invalid or missing secret.'});
-    }
-
     const action = String(data.action || '').toLowerCase();
 
     // Structured Kobo-style attendance submission.

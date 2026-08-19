@@ -29,7 +29,19 @@ fullscreen = 0
 
 # Camera (staff photo capture), GPS (base location capture + check-in/out),
 # and storage (sqlite db + saved staff photos) are all used by main.py.
-android.permissions = CAMERA,ACCESS_FINE_LOCATION,ACCESS_COARSE_LOCATION,READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE,INTERNET,POST_NOTIFICATIONS
+# FOREGROUND_SERVICE / FOREGROUND_SERVICE_DATA_SYNC / WAKE_LOCK / RECEIVE_BOOT_COMPLETED
+# are for the "Reminder" background service (service_reminder.py) below, which
+# keeps firing the 07:50/07:55/07:59 check-in and 15:50-series check-out
+# reminders even while the app itself is closed or the screen is off.
+android.permissions = CAMERA,ACCESS_FINE_LOCATION,ACCESS_COARSE_LOCATION,READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE,READ_MEDIA_IMAGES,INTERNET,POST_NOTIFICATIONS,FOREGROUND_SERVICE,FOREGROUND_SERVICE_DATA_SYNC,WAKE_LOCK,RECEIVE_BOOT_COMPLETED
+
+# Background reminder service - runs service_reminder.py as an independent
+# Android Service/process (started from main.py's on_start), so the
+# check-in/out reminders keep firing while the app is closed. ",foreground"
+# makes it a foreground service with a persistent low-priority notification,
+# which is required on modern Android so the OS doesn't kill it under Doze /
+# battery optimization.
+services = Reminder:service_reminder.py:foreground
 
 android.api = 34
 android.minapi = 21
