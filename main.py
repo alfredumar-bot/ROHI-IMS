@@ -477,7 +477,7 @@ STATE_OFFICES = [
 ]
 
 OFFICES = {
-    "Borno State Office": {"latitude": 11.806543, "longitude": 13.117668, "radius": 100},
+    "Borno State Office": {"latitude": 11.797352, "longitude": 13.143040, "radius": 300},
     "Adamawa HQ": {"latitude": 9.2781640, "longitude": 12.432640, "radius": 100},
     "Yobe State Office": {"latitude": 11.7460, "longitude": 11.9660, "radius": 100},
     "Taraba State Office": {"latitude": 8.8936, "longitude": 11.3595, "radius": 100},
@@ -2921,6 +2921,335 @@ class ROHIAttendanceApp(MDApp):
             if hasattr(dash_ids, 'check_out_btn'):
                 dash_ids.check_out_btn.disabled = not self.checked_in
 
+    def _ensure_checkout_location_permission(self):
+        """Ensure Android location permission is available before Check-Out GPS capture."""
+        if platform != "android":
+            return True
+
+        # Packaged python-for-android builds.
+        try:
+            from android.permissions import check_permission, request_permissions, Permission
+            fine = bool(check_permission(Permission.ACCESS_FINE_LOCATION))
+            coarse = bool(check_permission(Permission.ACCESS_COARSE_LOCATION))
+            if fine or coarse:
+                return True
+            self._checkout_pending = True
+            logger.info("Requesting Android location permission for Check-Out.")
+            request_permissions(
+                [Permission.ACCESS_FINE_LOCATION, Permission.ACCESS_COARSE_LOCATION],
+                self._on_checkout_location_permission_result,
+            )
+            return False
+        except ImportError:
+            pass
+        except Exception:
+            logger.exception("python-for-android Check-Out location permission request failed.")
+
+        # Pydroid / Java API fallback.
+        try:
+            from jnius import autoclass
+            PythonActivity = autoclass('org.kivy.android.PythonActivity')
+            ManifestPermission = autoclass('android.Manifest$permission')
+            PackageManager = autoclass('android.content.pm.PackageManager')
+            activity = PythonActivity.mActivity
+            fine_perm = ManifestPermission.ACCESS_FINE_LOCATION
+            coarse_perm = ManifestPermission.ACCESS_COARSE_LOCATION
+            fine = activity.checkSelfPermission(fine_perm) == PackageManager.PERMISSION_GRANTED
+            coarse = activity.checkSelfPermission(coarse_perm) == PackageManager.PERMISSION_GRANTED
+            if fine or coarse:
+                return True
+            self._checkout_pending = True
+            logger.info("Requesting Android/Pydroid location permission for Check-Out.")
+            activity.requestPermissions([fine_perm, coarse_perm], 7312)
+            Clock.schedule_once(lambda dt: self._finish_pydroid_checkout_permission_check(), 0.8)
+            return False
+        except Exception:
+            logger.exception("Could not verify/request Android Check-Out location permission.")
+            self._checkout_pending = False
+            self._show_gps_failure(
+                "Location permission could not be requested. Open Android Settings > Apps > ROHI IMS > Permissions > Location and allow Precise Location, then try Check-Out again."
+            )
+            try:
+                self.dashboard_screen.ids.check_out_btn.disabled = False
+            except Exception:
+                pass
+            return False
+
+    @mainthread
+    def _on_checkout_location_permission_result(self, permissions, grants):
+        try:
+            granted = any(bool(g) for g in grants)
+        except Exception:
+            granted = False
+        if granted and self._checkout_pending:
+            self._start_live_checkout_gps()
+        elif self._checkout_pending:
+            self._checkout_pending = False
+            self._show_gps_failure(
+                "Location permission is required. Allow Precise Location for ROHI IMS, then press Check-Out again."
+            )
+            try:
+                self.dashboard_screen.ids.check_out_btn.disabled = False
+            except Exception:
+                pass
+
+    def _finish_pydroid_checkout_permission_check(self):
+        """Re-check the Pydroid Android permission dialog result and continue Check-Out GPS."""
+        if not self._checkout_pending:
+            return
+        try:
+            from jnius import autoclass
+            PythonActivity = autoclass('org.kivy.android.PythonActivity')
+            ManifestPermission = autoclass('android.Manifest$permission')
+            PackageManager = autoclass('android.content.pm.PackageManager')
+            activity = PythonActivity.mActivity
+            fine = activity.checkSelfPermission(ManifestPermission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+            coarse = activity.checkSelfPermission(ManifestPermission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+            if fine or coarse:
+                logger.info("Pydroid Android location permission granted for Check-Out; starting GPS.")
+                self._start_live_checkout_gps()
+                return
+            self._checkout_pending = False
+            self._show_gps_failure(
+                "Location permission is required. Allow Precise Location for ROHI IMS, then press Check-Out again."
+            )
+            self.dashboard_screen.ids.check_out_btn.disabled = False
+        except Exception:
+            logger.exception("Could not verify Pydroid Check-Out location permission.")
+            self._checkout_pending = False
+            try:
+                self.dashboard_screen.ids.check_out_btn.disabled = False
+            except Exception:
+                pass
+
+    def _start_android_checkout_location_polling(self):
+        """Poll Android last-known phone location as a Check-Out reliability fallback."""
+        if platform != "android":
+            return
+        try:
+            from jnius import autoclass
+            Context = autoclass("android.content.Context")
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            manager = PythonActivity.mActivity.getSystemService(Context.LOCATION_SERVICE)
+            LocationManager = autoclass("android.location.LocationManager")
+            providers = []
+            for provider in (LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER):
+                try:
+                    if manager.isProviderEnabled(provider):
+                        providers.append(provider)
+                except Exception:
+                    pass
+            if not providers:
+                return
+
+            old_stop = self._gps_poll_stop
+            if old_stop is not None:
+                try:
+                    old_stop.set()
+                except Exception:
+                    pass
+            stop_event = threading.Event()
+            self._gps_poll_stop = stop_event
+
+            def worker():
+                deadline = time.time() + 32
+                while not stop_event.is_set() and time.time() < deadline and self._checkout_pending:
+                    best = None
+                    now_ms = int(time.time() * 1000)
+                    for provider in providers:
+                        try:
+                            loc = manager.getLastKnownLocation(provider)
+                            if loc is None:
+                                continue
+                            lat = float(loc.getLatitude())
+                            lon = float(loc.getLongitude())
+                            accuracy = float(loc.getAccuracy()) if loc.hasAccuracy() else 9999.0
+                            loc_time = int(loc.getTime())
+                            age_s = max(0.0, (now_ms - loc_time) / 1000.0) if loc_time > 0 else 0.0
+                            if accuracy <= 150.0 and (loc_time <= 0 or age_s <= 600.0):
+                                candidate = (accuracy, age_s, lat, lon)
+                                if best is None or candidate[:2] < best[:2]:
+                                    best = candidate
+                        except Exception:
+                            continue
+                    if best is not None:
+                        accuracy, age_s, lat, lon = best
+                        logger.info(
+                            "Android Check-Out GPS poll fix: %.7f, %.7f accuracy=%.1fm age=%.1fs",
+                            lat, lon, accuracy, age_s
+                        )
+                        Clock.schedule_once(
+                            lambda dt, la=lat, lo=lon, ac=accuracy: self._on_android_checkout_location(la, lo, ac),
+                            0
+                        )
+                        return
+                    time.sleep(1.0)
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception:
+            logger.exception("Android Check-Out GPS polling fallback failed.")
+
+    def _start_android_checkout_location_fallback(self):
+        """Request a real Android LocationManager fix for Check-Out."""
+        from jnius import autoclass, PythonJavaClass, java_method
+        LocationManager = autoclass('android.location.LocationManager')
+        Looper = autoclass('android.os.Looper')
+        Context = autoclass('android.content.Context')
+
+        app_context = None
+        try:
+            app_context = self._get_android_activity()
+        except Exception:
+            try:
+                app_context = self._android_context
+            except Exception:
+                pass
+        if app_context is None:
+            raise RuntimeError("Android activity context unavailable")
+
+        manager = app_context.getSystemService(Context.LOCATION_SERVICE)
+        if manager is None:
+            raise RuntimeError("Android LocationManager unavailable")
+
+        outer = self
+
+        class CheckoutLocationListener(PythonJavaClass):
+            __javainterfaces__ = ['android/location/LocationListener']
+            __javacontext__ = 'app'
+
+            @java_method('(Landroid/location/Location;)V')
+            def onLocationChanged(self, location):
+                try:
+                    if location is not None:
+                        lat = float(location.getLatitude())
+                        lon = float(location.getLongitude())
+                        accuracy = float(location.getAccuracy()) if location.hasAccuracy() else None
+                        logger.info(
+                            "Android Check-Out LocationManager fix: %.7f, %.7f accuracy=%s",
+                            lat, lon, accuracy
+                        )
+                        outer._on_android_checkout_location(lat, lon, accuracy)
+                except Exception:
+                    logger.exception("Android Check-Out location callback failed")
+
+            @java_method('(Ljava/lang/String;I)V')
+            def onStatusChanged(self, provider, status):
+                pass
+
+            @java_method('(Ljava/lang/String;)V')
+            def onProviderEnabled(self, provider):
+                logger.info("Android Check-Out location provider enabled: %s", provider)
+
+            @java_method('(Ljava/lang/String;)V')
+            def onProviderDisabled(self, provider):
+                logger.warning("Android Check-Out location provider disabled: %s", provider)
+
+        listener = CheckoutLocationListener()
+        self._android_location_listener = listener
+
+        providers = []
+        for provider in (LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER):
+            try:
+                if manager.isProviderEnabled(provider):
+                    providers.append(provider)
+            except Exception:
+                pass
+        if not providers:
+            raise RuntimeError("No Android location provider is enabled")
+
+        now_ms = int(time.time() * 1000)
+        best_last = None
+        for provider in providers:
+            try:
+                last = manager.getLastKnownLocation(provider)
+                if last is not None:
+                    last_time = int(last.getTime())
+                    age_ms = max(0, now_ms - last_time) if last_time > 0 else 0
+                    accuracy = float(last.getAccuracy()) if last.hasAccuracy() else 9999.0
+                    if (last_time <= 0 or age_ms <= 900000) and accuracy <= 150.0:
+                        candidate = (age_ms, accuracy, float(last.getLatitude()), float(last.getLongitude()))
+                        if best_last is None or candidate[:2] < best_last[:2]:
+                            best_last = candidate
+            except Exception:
+                logger.exception("Could not read Android Check-Out last-known location from %s", provider)
+
+        requested = False
+        for provider in providers:
+            try:
+                manager.requestLocationUpdates(provider, 1000, 0.0, listener, Looper.getMainLooper())
+                requested = True
+                logger.info("Android live Check-Out location updates requested from %s", provider)
+            except Exception:
+                logger.exception("Could not request live Android Check-Out updates from %s", provider)
+
+        if best_last is not None:
+            _, accuracy, lat, lon = best_last
+            logger.info("Using recent Android phone location immediately for Check-Out: age/accuracy=%s", best_last[:2])
+            self._on_android_checkout_location(lat, lon, accuracy)
+            return
+        if not requested:
+            raise RuntimeError("Android could not register any live Check-Out location provider")
+
+    @mainthread
+    def _on_android_checkout_location(self, lat, lon, accuracy=None):
+        if not self._checkout_pending:
+            return
+        if accuracy is not None and accuracy > 150:
+            logger.warning("Ignoring inaccurate Android Check-Out location: accuracy=%.1fm", accuracy)
+            return
+        self._checkout_gps_fix = (float(lat), float(lon))
+        self.current_location = f"{float(lat):.6f}° N, {float(lon):.6f}° E"
+        logger.info("Fresh Android GPS accepted for Check-Out: %s accuracy=%s", self.current_location, accuracy)
+        self._cancel_gps_timeout()
+        try:
+            gps.stop()
+        except Exception:
+            pass
+        self._stop_android_location_updates()
+        self._finalize_check_out()
+
+    def _start_live_checkout_gps(self):
+        """Start Plyer GPS plus Android LocationManager/polling fallbacks for Check-Out."""
+        self._cancel_gps_timeout()
+        started = False
+        try:
+            gps.configure(on_location=self._on_checkout_gps, on_status=self.gps_status)
+            gps.start(minTime=500, minDistance=0)
+            started = True
+            logger.info("Plyer GPS started for Check-Out.")
+        except Exception:
+            logger.exception("Plyer GPS start failed; Android Check-Out fallback will be attempted.")
+
+        if platform == "android":
+            try:
+                from android.permissions import check_permission, Permission
+                fine = bool(check_permission(Permission.ACCESS_FINE_LOCATION))
+                coarse = bool(check_permission(Permission.ACCESS_COARSE_LOCATION))
+            except ImportError:
+                fine = coarse = False
+            except Exception:
+                fine = coarse = False
+
+            if fine or coarse:
+                try:
+                    self._start_android_checkout_location_fallback()
+                    self._start_android_checkout_location_polling()
+                    started = True
+                except Exception:
+                    logger.exception("Android Check-Out LocationManager fallback failed.")
+
+        if not started:
+            self._checkout_pending = False
+            self._show_gps_failure(
+                "GPS could not be started. Turn ON Location/GPS and make sure the device allows ROHI IMS to use location, then try Check-Out again."
+            )
+            try:
+                self.dashboard_screen.ids.check_out_btn.disabled = False
+            except Exception:
+                pass
+            return
+
+        self._gps_timeout_event = Clock.schedule_once(self._checkout_gps_timeout, 30)
+
     def check_out(self):
         """Captures a fresh GPS fix at the moment Check-Out is pressed, and
         evaluates it against the registered office coordinate (informational -
@@ -2957,14 +3286,13 @@ class ROHIAttendanceApp(MDApp):
         self._gps_poll_stop = None
         self._gps_timeout_event = None
         self.current_location = ""
-        try:
-            gps.configure(on_location=self._on_checkout_gps, on_status=self.gps_status)
-            gps.start(minTime=1000, minDistance=1)
-            Clock.schedule_once(self._checkout_gps_timeout, 10)
-        except Exception:
-            logger.exception("GPS start error during check-out; no fresh phone coordinate available.")
-            self._checkout_pending = False
-            self._show_gps_failure("Check-Out denied: GPS could not be started. Please enable Location and try again.")
+
+        # Use the same permission + multi-provider GPS strategy as Check-In.
+        # The previous Check-Out path only started Plyer GPS, which could time
+        # out on Android/Pydroid even though Check-In had already obtained a fix.
+        if not self._ensure_checkout_location_permission():
+            return
+        self._start_live_checkout_gps()
 
     def _on_checkout_gps(self, **kwargs):
         # See _on_checkin_gps: marshal off the plyer callback thread and
@@ -4886,6 +5214,11 @@ class ROHIAttendanceApp(MDApp):
             "check_out": check_out or "",
             "checkin_gps": checkin_gps or "",
             "checkout_gps": checkout_gps or "",
+            "late_hour": str(getattr(self, "late_duration_str", "") or "On Time"),
+            "attendance_status": str(
+                "Present but Late" if getattr(self, "late_duration_str", "On Time") != "On Time"
+                else "Present (On Time)"
+            ),
         }
         return self._post_rohi_json(endpoint, payload, timeout=30)
 

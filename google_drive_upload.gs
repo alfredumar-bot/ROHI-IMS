@@ -164,6 +164,12 @@ function submitAttendance_(data) {
     setCell_(values, headers, ['Verified Check in'], 'Pending');
   }
 
+  // Always write the calculated late duration into the template's
+  // "Late Hour" column. This was previously calculated in the Android app
+  // but never included in the online Google Sheet payload.
+  const lateHour = String(data.late_hour || data.late_duration || 'On Time');
+  setCell_(values, headers, ['Late Hour','Late hour','Hours Late'], lateHour);
+
   if (checkOut) {
     setCell_(values, headers, ['Check out'], 'present');
     setCell_(values, headers, ['Check out Time','check out time'], timePart_(checkOut));

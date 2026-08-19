@@ -63,3 +63,10 @@ Do not put a `/pubhtml` viewing URL into `SpreadsheetApp.openById()`. The editab
 
 ## Important test
 The APK/Pydroid code is now fixed for the above behavior. Real Google upload/update can only become live after the one-time Google Apps Script deployment and the two editable spreadsheet IDs are supplied.
+
+
+### 2026-08-21 Attendance fixes
+- Check-Out now requests Android location permission when needed and uses Plyer GPS plus Android LocationManager live updates and last-known-location polling, matching the reliable Check-In GPS path.
+- Check-Out GPS timeout increased from 10 seconds to 30 seconds.
+- Attendance JSON now sends `late_hour` and `attendance_status`.
+- Google Apps Script now writes `late_hour` into the existing `Late Hour` column in the online ROHI Attendance Report.
