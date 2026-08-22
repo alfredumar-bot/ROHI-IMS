@@ -341,6 +341,7 @@ from kivymd.uix.pickers import MDDatePicker
 from kivymd.uix.menu import MDDropdownMenu
 from kivymd.uix.dialog import MDDialog
 from kivymd.uix.button import MDFlatButton
+from kivymd.uix.textfield import MDTextField
 from plyer import camera, gps
 
 # Import RegistrationScreen from screens module
@@ -477,12 +478,12 @@ STATE_OFFICES = [
 ]
 
 OFFICES = {
-    "Borno State Office": {"latitude": 11.806576, "longitude": 13.117692, "radius": 50},
-    "Adamawa HQ": {"latitude": 9.2781640, "longitude": 12.432640, "radius": 50},
-    "Yobe State Office": {"latitude": 11.7460, "longitude": 11.9660, "radius": 50},
-    "Taraba State Office": {"latitude": 8.8936, "longitude": 11.3595, "radius": 50},
-    "Benue State Office": {"latitude": 7.7322, "longitude": 8.5391, "radius": 50},
-    "Sokoto State Office": {"latitude": 13.0622, "longitude": 5.2339, "radius": 50},
+    "Borno State Office": {"latitude": 11.806576, "longitude": 13.117692, "radius": 30},
+    "Adamawa HQ": {"latitude": 9.2781640, "longitude": 12.432640, "radius": 30},
+    "Yobe State Office": {"latitude": 11.7460, "longitude": 11.9660, "radius": 30},
+    "Taraba State Office": {"latitude": 8.8936, "longitude": 11.3595, "radius": 30},
+    "Benue State Office": {"latitude": 7.7322, "longitude": 8.5391, "radius": 30},
+    "Sokoto State Office": {"latitude": 13.0622, "longitude": 5.2339, "radius": 30},
 }
 
 # Compulsory registration fields (marked with * on the form), paired with
@@ -569,6 +570,9 @@ class ROHIAttendanceApp(MDApp):
         # Persisted in app_settings.json (separate from server_config.json) so it
         # survives restarts but is untouched by Reset Database / server config changes.
         self.GEOFENCE_RADIUS_METERS = self._load_geofence_radius()
+        # All ROHI offices use a strict 30 m geofence. This is deliberately
+        # not changed by stale per-device settings.
+        self.GEOFENCE_RADIUS_METERS = 30
 
         # Load KV Files safely
         try:
@@ -717,7 +721,7 @@ class ROHIAttendanceApp(MDApp):
             if os.path.exists(path):
                 with open(path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                return int(data.get("geofence_radius_meters", 50))
+                return int(data.get("geofence_radius_meters", 30))
         except Exception:
             logger.exception("Failed to load app_settings.json; using default geofence radius.")
         return 50
@@ -838,20 +842,51 @@ class ROHIAttendanceApp(MDApp):
         create_table()
 
     def confirm_reset_database(self):
-        """Confirm clearing attendance history while preserving all staff."""
+        """Require the administrator reset password before clearing attendance."""
         self._dismiss_active_menu()
-        if getattr(self, "_reset_dialog", None): self._reset_dialog.dismiss()
+        try:
+            if getattr(self, "_reset_dialog", None):
+                self._reset_dialog.dismiss()
+        except Exception:
+            pass
+
+        box = MDBoxLayout(orientation="vertical", spacing=dp(12), padding=[dp(8), dp(8), dp(8), dp(4)],
+                          size_hint_y=None, height=dp(72))
+        field = MDTextField(hint_text="Reset password", password=True, mode="rectangle",
+                            helper_text="Enter administrator password", helper_text_mode="persistent")
+        box.add_widget(field)
+        self._reset_password_field = field
+
         self._reset_dialog = MDDialog(
-            title="Clear Attendance History?",
-            text="This permanently deletes local check-in/check-out records and attendance reports. Registered staff, profiles, passwords and office GPS settings will NOT be deleted. Continue?",
+            title="Reset Database",
+            text="Enter the administrator password to permanently clear local attendance records. Staff registrations will be preserved.",
+            type="custom",
+            content_cls=box,
             buttons=[
                 MDFlatButton(text="CANCEL", on_release=lambda *a: self._reset_dialog.dismiss()),
-                MDFlatButton(text="CLEAR ATTENDANCE", theme_text_color="Custom", text_color=(0.8,0.1,0.1,1), on_release=lambda *a: self._do_confirmed_reset()),
-            ],)
+                MDFlatButton(text="RESET", theme_text_color="Custom", text_color=(0.8,0.1,0.1,1),
+                              on_release=lambda *a: self._verify_reset_password()),
+            ],
+        )
         self._reset_dialog.open()
 
+    def _verify_reset_password(self):
+        """Only reset when the exact administrator password is supplied."""
+        entered = str(getattr(self, "_reset_password_field", None).text if getattr(self, "_reset_password_field", None) else "")
+        if entered != REPORT_EXPORT_PASSWORD:
+            try:
+                self._reset_password_field.error = True
+                self._reset_password_field.helper_text = "Incorrect password. Database was NOT reset."
+            except Exception:
+                pass
+            logger.warning("Database reset rejected: incorrect password.")
+            return
+        self._do_confirmed_reset()
+
     def _do_confirmed_reset(self):
-        if getattr(self, "_reset_dialog", None): self._reset_dialog.dismiss()
+        if getattr(self, "_reset_dialog", None):
+            try: self._reset_dialog.dismiss()
+            except Exception: pass
         self.reset_database_tables()
         try: self.update_dashboard_metrics()
         except Exception: logger.exception("Could not refresh attendance summary after clearing history.")
@@ -2496,6 +2531,8 @@ class ROHIAttendanceApp(MDApp):
                 dash_ids.total_days_present.text = f"{days_present} Days"
             if hasattr(dash_ids, 'total_days_absent'):
                 dash_ids.total_days_absent.text = f"{days_absent} Days"
+            if hasattr(dash_ids, 'card_present_count'):
+                dash_ids.card_present_count.text = f"{days_present} Days"
             if hasattr(dash_ids, 'card_absent_count'):
                 dash_ids.card_absent_count.text = f"{days_absent} Days"
             if hasattr(dash_ids, 'card_punctuality_rate'):
@@ -2518,10 +2555,12 @@ class ROHIAttendanceApp(MDApp):
     }
 
     def _staff_can_attend_weekends(self):
-        """Return True when the registered staff section allows Friday-Sunday attendance."""
+        """Return True when Information Management or Security staff may attend Fri-Sun."""
         try:
             section = str(self.current_user[16] if self.current_user and len(self.current_user) > 16 else "").strip().upper()
-            return section in self.WEEKEND_ATTENDANCE_SECTIONS
+            # Accept both separate sections ("INFORMATION MANAGEMENT", "SECURITY")
+            # and combined labels such as "INFORMATION MANAGEMENT AND SECURITY".
+            return ("INFORMATION MANAGEMENT" in section or "SECURITY" in section or section == "HR")
         except Exception:
             return False
 
@@ -3023,70 +3062,8 @@ class ROHIAttendanceApp(MDApp):
                 pass
 
     def _start_android_checkout_location_polling(self):
-        """Poll Android last-known phone location as a Check-Out reliability fallback."""
-        if platform != "android":
-            return
-        try:
-            from jnius import autoclass
-            Context = autoclass("android.content.Context")
-            PythonActivity = autoclass("org.kivy.android.PythonActivity")
-            manager = PythonActivity.mActivity.getSystemService(Context.LOCATION_SERVICE)
-            LocationManager = autoclass("android.location.LocationManager")
-            providers = []
-            for provider in (LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER):
-                try:
-                    if manager.isProviderEnabled(provider):
-                        providers.append(provider)
-                except Exception:
-                    pass
-            if not providers:
-                return
-
-            old_stop = self._gps_poll_stop
-            if old_stop is not None:
-                try:
-                    old_stop.set()
-                except Exception:
-                    pass
-            stop_event = threading.Event()
-            self._gps_poll_stop = stop_event
-
-            def worker():
-                deadline = time.time() + 32
-                while not stop_event.is_set() and time.time() < deadline and self._checkout_pending:
-                    best = None
-                    now_ms = int(time.time() * 1000)
-                    for provider in providers:
-                        try:
-                            loc = manager.getLastKnownLocation(provider)
-                            if loc is None:
-                                continue
-                            lat = float(loc.getLatitude())
-                            lon = float(loc.getLongitude())
-                            accuracy = float(loc.getAccuracy()) if loc.hasAccuracy() else 9999.0
-                            loc_time = int(loc.getTime())
-                            age_s = max(0.0, (now_ms - loc_time) / 1000.0) if loc_time > 0 else 0.0
-                            if accuracy <= 150.0 and (loc_time <= 0 or age_s <= 600.0):
-                                candidate = (accuracy, age_s, lat, lon)
-                                if best is None or candidate[:2] < best[:2]:
-                                    best = candidate
-                        except Exception:
-                            continue
-                    if best is not None:
-                        accuracy, age_s, lat, lon = best
-                        logger.info(
-                            "Android Check-Out GPS poll fix: %.7f, %.7f accuracy=%.1fm age=%.1fs",
-                            lat, lon, accuracy, age_s
-                        )
-                        Clock.schedule_once(
-                            lambda dt, la=lat, lo=lon, ac=accuracy: self._on_android_checkout_location(la, lo, ac),
-                            0
-                        )
-                        return
-                    time.sleep(1.0)
-            threading.Thread(target=worker, daemon=True).start()
-        except Exception:
-            logger.exception("Android Check-Out GPS polling fallback failed.")
+        """No last-known-location polling for Check-Out. It can return stale Check-In GPS."""
+        return
 
     def _start_android_checkout_location_fallback(self):
         """Request a real Android LocationManager fix for Check-Out."""
@@ -3120,6 +3097,11 @@ class ROHIAttendanceApp(MDApp):
             def onLocationChanged(self, location):
                 try:
                     if location is not None:
+                        location_time = int(location.getTime()) if location.getTime() else 0
+                        started_ms = int(getattr(outer, "_checkout_location_request_started_ms", 0) or 0)
+                        if started_ms and location_time and location_time < started_ms - 1500:
+                            logger.info("Ignoring stale Android Check-Out location: age=%sms", started_ms - location_time)
+                            return
                         lat = float(location.getLatitude())
                         lon = float(location.getLongitude())
                         accuracy = float(location.getAccuracy()) if location.hasAccuracy() else None
@@ -3156,22 +3138,11 @@ class ROHIAttendanceApp(MDApp):
         if not providers:
             raise RuntimeError("No Android location provider is enabled")
 
-        now_ms = int(time.time() * 1000)
-        best_last = None
-        for provider in providers:
-            try:
-                last = manager.getLastKnownLocation(provider)
-                if last is not None:
-                    last_time = int(last.getTime())
-                    age_ms = max(0, now_ms - last_time) if last_time > 0 else 0
-                    accuracy = float(last.getAccuracy()) if last.hasAccuracy() else 9999.0
-                    if (last_time <= 0 or age_ms <= 900000) and accuracy <= 150.0:
-                        candidate = (age_ms, accuracy, float(last.getLatitude()), float(last.getLongitude()))
-                        if best_last is None or candidate[:2] < best_last[:2]:
-                            best_last = candidate
-            except Exception:
-                logger.exception("Could not read Android Check-Out last-known location from %s", provider)
-
+        # IMPORTANT: never use Android's last-known location for Check-Out.
+        # It can be the exact Check-In coordinate even after the phone moved.
+        # Only a LocationManager callback received after this request starts is
+        # accepted as the Check-Out GPS.
+        self._checkout_location_request_started_ms = int(time.time() * 1000)
         requested = False
         for provider in providers:
             try:
@@ -3181,11 +3152,6 @@ class ROHIAttendanceApp(MDApp):
             except Exception:
                 logger.exception("Could not request live Android Check-Out updates from %s", provider)
 
-        if best_last is not None:
-            _, accuracy, lat, lon = best_last
-            logger.info("Using recent Android phone location immediately for Check-Out: age/accuracy=%s", best_last[:2])
-            self._on_android_checkout_location(lat, lon, accuracy)
-            return
         if not requested:
             raise RuntimeError("Android could not register any live Check-Out location provider")
 
@@ -3208,47 +3174,33 @@ class ROHIAttendanceApp(MDApp):
         self._finalize_check_out()
 
     def _start_live_checkout_gps(self):
-        """Start Plyer GPS plus Android LocationManager/polling fallbacks for Check-Out."""
+        """Capture a genuinely new Check-Out GPS fix; never reuse Check-In GPS."""
         self._cancel_gps_timeout()
-        started = False
-        try:
-            gps.configure(on_location=self._on_checkout_gps, on_status=self.gps_status)
-            gps.start(minTime=500, minDistance=0)
-            started = True
-            logger.info("Plyer GPS started for Check-Out.")
-        except Exception:
-            logger.exception("Plyer GPS start failed; Android Check-Out fallback will be attempted.")
+        self._checkout_location_request_started_ms = int(time.time() * 1000)
 
         if platform == "android":
             try:
-                from android.permissions import check_permission, Permission
-                fine = bool(check_permission(Permission.ACCESS_FINE_LOCATION))
-                coarse = bool(check_permission(Permission.ACCESS_COARSE_LOCATION))
-            except ImportError:
-                fine = coarse = False
+                self._start_android_checkout_location_fallback()
+                self._gps_timeout_event = Clock.schedule_once(self._checkout_gps_timeout, 30)
+                return
             except Exception:
-                fine = coarse = False
+                logger.exception("Android live Check-Out GPS failed; trying Plyer fallback.")
 
-            if fine or coarse:
-                try:
-                    self._start_android_checkout_location_fallback()
-                    self._start_android_checkout_location_polling()
-                    started = True
-                except Exception:
-                    logger.exception("Android Check-Out LocationManager fallback failed.")
-
-        if not started:
+        try:
+            gps.configure(on_location=self._on_checkout_gps, on_status=self.gps_status)
+            gps.start(minTime=500, minDistance=0)
+            self._gps_timeout_event = Clock.schedule_once(self._checkout_gps_timeout, 30)
+            logger.info("Plyer GPS started for Check-Out fallback.")
+        except Exception:
+            logger.exception("Plyer GPS start failed for Check-Out.")
             self._checkout_pending = False
             self._show_gps_failure(
-                "GPS could not be started. Turn ON Location/GPS and make sure the device allows ROHI IMS to use location, then try Check-Out again."
+                "GPS could not be started. Turn ON Location/GPS and allow ROHI IMS to use location, then try Check-Out again."
             )
             try:
                 self.dashboard_screen.ids.check_out_btn.disabled = False
             except Exception:
                 pass
-            return
-
-        self._gps_timeout_event = Clock.schedule_once(self._checkout_gps_timeout, 30)
 
     def check_out(self):
         """Captures a fresh GPS fix at the moment Check-Out is pressed, and
@@ -4071,7 +4023,9 @@ class ROHIAttendanceApp(MDApp):
         ids.report_month_spinner.text = now.strftime("%B")
         ids.report_year_spinner.text = str(now.year)
         ids.report_day_spinner.text = "All Days (Monthly)"
-        self.generate_report()
+        self._populate_report_profile_header()
+        if hasattr(ids, "report_status_label"):
+            ids.report_status_label.text = "Choose a period and press GENERATE REPORT to create the report."
 
     def _populate_report_profile_header(self):
         if not self.current_user:
@@ -5665,21 +5619,13 @@ class ROHIAttendanceApp(MDApp):
                 except Exception:
                     return True
 
-            if due("last_staff_sync", STAFF_EXCEL_SYNC_INTERVAL_SECONDS) and not self._excel_staff_schedule_running:
-                self._excel_staff_schedule_running = True
-                threading.Thread(target=self._generate_staff_excel_for_sync, daemon=True).start()
-
-            if due("last_timesheet_sync", TIMESHEET_EXCEL_SYNC_INTERVAL_SECONDS) and not self._excel_timesheet_schedule_running:
-                self._excel_timesheet_schedule_running = True
-                threading.Thread(target=self._generate_timesheet_excel_for_sync, daemon=True).start()
-
-            if due("last_attendance_sync", ATTENDANCE_EXCEL_SYNC_INTERVAL_SECONDS) and not self._excel_attendance_schedule_running:
-                self._excel_attendance_schedule_running = True
-                threading.Thread(target=self._generate_attendance_excel_for_sync, daemon=True).start()
-
-            if due("last_leave_sync", LEAVE_EXCEL_SYNC_INTERVAL_SECONDS) and not self._excel_leave_schedule_running:
-                self._excel_leave_schedule_running = True
-                threading.Thread(target=self._generate_leave_excel_for_sync, daemon=True).start()
+            # Do not generate XLSX files automatically. Report files are created
+            # only when the user presses a report/export button. The existing
+            # Google/Apps Script attendance endpoint still receives check-in/out
+            # rows immediately, and the manual SEND TO GOOGLE EXCEL buttons keep
+            # their configured links/endpoints. This also prevents background
+            # workbook generation from destabilizing Android/Pydroid sessions.
+            return
         except Exception:
             logger.exception("Excel sync scheduler tick failed.")
 

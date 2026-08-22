@@ -267,10 +267,48 @@
 
                                 # 2. Attendance Status Metrics Cards (Absent, Punctuality, Late + Zigzag Trend)
                                 MDGridLayout:
-                                    cols: 3
+                                    cols: 2
                                     spacing: dp(8)
                                     size_hint_y: None
-                                    height: dp(80)
+                                    height: dp(166)
+
+                                    # Present Card
+                                    MDCard:
+                                        orientation: 'vertical'
+                                        padding: dp(10)
+                                        spacing: dp(2)
+                                        radius: [10,]
+                                        md_bg_color: 1, 1, 1, 1
+                                        elevation: 1
+
+                                        MDBoxLayout:
+                                            spacing: dp(4)
+                                            adaptive_height: True
+                                            MDIcon:
+                                                icon: "account-check-outline"
+                                                theme_text_color: "Custom"
+                                                text_color: 0.1, 0.6, 0.2, 1
+                                                font_size: "16sp"
+                                            MDLabel:
+                                                text: "Present"
+                                                font_style: "Caption"
+                                                theme_text_color: "Secondary"
+                                                adaptive_height: True
+
+                                        MDLabel:
+                                            id: card_present_count
+                                            text: "0 Days"
+                                            font_style: "Subtitle1"
+                                            bold: True
+                                            theme_text_color: "Custom"
+                                            text_color: 0.1, 0.6, 0.2, 1
+                                            adaptive_height: True
+
+                                        MDLabel:
+                                            text: "Captured This Month"
+                                            font_style: "Caption"
+                                            font_size: "10sp"
+                                            theme_text_color: "Hint"
 
                                     # Absent Card
                                     MDCard:
