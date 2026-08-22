@@ -477,12 +477,12 @@ STATE_OFFICES = [
 ]
 
 OFFICES = {
-    "Borno State Office": {"latitude": 11.797352, "longitude": 13.143040, "radius": 300},
-    "Adamawa HQ": {"latitude": 9.2781640, "longitude": 12.432640, "radius": 100},
-    "Yobe State Office": {"latitude": 11.7460, "longitude": 11.9660, "radius": 100},
-    "Taraba State Office": {"latitude": 8.8936, "longitude": 11.3595, "radius": 100},
-    "Benue State Office": {"latitude": 7.7322, "longitude": 8.5391, "radius": 100},
-    "Sokoto State Office": {"latitude": 13.0622, "longitude": 5.2339, "radius": 100},
+    "Borno State Office": {"latitude": 11.799984, "longitude": 13.120731, "radius": 50},
+    "Adamawa HQ": {"latitude": 9.2781640, "longitude": 12.432640, "radius": 50},
+    "Yobe State Office": {"latitude": 11.7460, "longitude": 11.9660, "radius": 50},
+    "Taraba State Office": {"latitude": 8.8936, "longitude": 11.3595, "radius": 50},
+    "Benue State Office": {"latitude": 7.7322, "longitude": 8.5391, "radius": 50},
+    "Sokoto State Office": {"latitude": 13.0622, "longitude": 5.2339, "radius": 50},
 }
 
 # Compulsory registration fields (marked with * on the form), paired with
@@ -533,7 +533,7 @@ class ROHIAttendanceApp(MDApp):
         
         self.photo_path = ""
         self.signature_path = ""
-        self.static_gps = "11.797352° N, 13.143040° E"
+        self.static_gps = "11.799984° N, 13.120731° E"
         # Never use the static office coordinate as a substitute for a live
         # phone GPS fix during Check-In/Check-Out.
         self.current_location = ""
@@ -717,10 +717,10 @@ class ROHIAttendanceApp(MDApp):
             if os.path.exists(path):
                 with open(path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                return int(data.get("geofence_radius_meters", 100))
+                return int(data.get("geofence_radius_meters", 50))
         except Exception:
             logger.exception("Failed to load app_settings.json; using default geofence radius.")
-        return 100
+        return 50
 
     def _load_google_form_url(self):
         try:

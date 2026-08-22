@@ -1,0 +1,15 @@
+ROHI Attendance Geofence Update
+
+All configured ROHI State Offices now use a strict 50 metre geofence for both Check-In and Check-Out.
+
+Updated offices:
+- Borno State Office: 50 m
+- Adamawa HQ: 50 m
+- Yobe State Office: 50 m
+- Taraba State Office: 50 m
+- Benue State Office: 50 m
+- Sokoto State Office: 50 m
+
+The fallback/default geofence radius is also 50 m.
+
+A GPS coordinate is accepted only when the captured phone location is at or below 50 metres from the fixed office coordinate.

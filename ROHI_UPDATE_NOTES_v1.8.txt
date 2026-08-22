@@ -1,8 +1,8 @@
 ROHI Attendance v1.8 - Pydroid Test
 
 1. GPS reliability fix
-- Borno State Office: 11.797352, 13.143040 (100 m)
-- Adamawa HQ: 9.2781640, 12.432640 (100 m)
+- Borno State Office: 11.799984, 13.120731 (50 m)
+- Adamawa HQ: 9.2781640, 12.432640 (50 m)
 - Android LocationManager now uses:
   * live GPS/network callbacks
   * a polling fallback for Android/Pydroid builds that do not deliver callbacks

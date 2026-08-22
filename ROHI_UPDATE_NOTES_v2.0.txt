@@ -6,9 +6,9 @@ ROHI Attendance Pydroid Test v2.0
 - Android LocationManager requests live GPS/network updates.
 - Last-known phone location fallback now accepts valid recent coordinates even when Android reports timestamp 0.
 - The office coordinate is NEVER used as the current device coordinate.
-- Borno: 11.797352, 13.143040
+- Borno: 11.799984, 13.120731
 - Adamawa HQ: 9.2781640, 12.432640
-- 100m geofence remains enforced.
+- 50m geofence remains enforced.
 
 2. Google destinations:
 - Attendance, Timesheet and Leave Send buttons never open an email chooser.

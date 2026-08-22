@@ -2,17 +2,17 @@ ROHI GPS TEST BUILD - BORNO + ADAMAWA
 ======================================
 
 Office coordinates:
-1. Borno State Office: 11.797352, 13.143040 (100 m)
-2. Adamawa HQ: 9.2781640, 12.432640 (100 m)
+1. Borno State Office: 11.799984, 13.120731 (50 m)
+2. Adamawa HQ: 9.2781640, 12.432640 (50 m)
 
 IMPORTANT TEST BEHAVIOUR
 - The app NEVER uses the office coordinate as the phone's current location.
 - Check-In requires a real phone GPS/location fix.
 - The app compares the live phone location with the selected user's State Office.
-- If the phone is within 100 m, Check-In is accepted and the live coordinate is saved.
-- If outside 100 m, Check-In is denied and the distance is displayed.
+- If the phone is within 50 m, Check-In is accepted and the live coordinate is saved.
+- If outside 50 m, Check-In is denied and the distance is displayed.
 - Android/Pydroid testing uses Plyer GPS first and Android LocationManager fallback when available.
-- A recent phone location may be used only when it is <=60 seconds old and <=100 m accuracy.
+- A recent phone location may be used only when it is <=60 seconds old and <=50 m accuracy.
 - No live location fix means Check-In is denied.
 
 PYDROID TEST
