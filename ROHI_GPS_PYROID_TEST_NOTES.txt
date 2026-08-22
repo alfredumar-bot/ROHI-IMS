@@ -2,7 +2,7 @@ ROHI GPS TEST BUILD - BORNO + ADAMAWA
 ======================================
 
 Office coordinates:
-1. Borno State Office: 11.799984, 13.120731 (50 m)
+1. Borno State Office: 11.806576, 13.117692 (50 m)
 2. Adamawa HQ: 9.2781640, 12.432640 (50 m)
 
 IMPORTANT TEST BEHAVIOUR

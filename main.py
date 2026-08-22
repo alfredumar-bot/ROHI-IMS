@@ -477,7 +477,7 @@ STATE_OFFICES = [
 ]
 
 OFFICES = {
-    "Borno State Office": {"latitude": 11.799984, "longitude": 13.120731, "radius": 50},
+    "Borno State Office": {"latitude": 11.806576, "longitude": 13.117692, "radius": 50},
     "Adamawa HQ": {"latitude": 9.2781640, "longitude": 12.432640, "radius": 50},
     "Yobe State Office": {"latitude": 11.7460, "longitude": 11.9660, "radius": 50},
     "Taraba State Office": {"latitude": 8.8936, "longitude": 11.3595, "radius": 50},
@@ -533,7 +533,7 @@ class ROHIAttendanceApp(MDApp):
         
         self.photo_path = ""
         self.signature_path = ""
-        self.static_gps = "11.799984° N, 13.120731° E"
+        self.static_gps = "11.806576° N, 13.117692° E"
         # Never use the static office coordinate as a substitute for a live
         # phone GPS fix during Check-In/Check-Out.
         self.current_location = ""

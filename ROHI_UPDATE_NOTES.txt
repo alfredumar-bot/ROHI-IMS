@@ -1,7 +1,7 @@
 ROHI Attendance App - Updated Build
 
 Key changes:
-1. Borno State Office GPS: 11.799984, 13.120731
+1. Borno State Office GPS: 11.806576, 13.117692
 2. Adamawa HQ GPS: 9.2781640, 12.432640
 3. Timesheet hours: Monday-Thursday = 8 hours; Friday = 4 hours.
 4. Timesheet Excel export now populates the supplied Corrected Timesheet.xlsx
@@ -38,7 +38,7 @@ URL into the corresponding upload endpoint field in the app.
 
 
 ROHI Attendance App v1.4 corrections:
-15. Borno State Office geofence target is fixed at 11.799984, 13.120731 with a 50 m radius.
+15. Borno State Office geofence target is fixed at 11.806576, 13.117692 with a 50 m radius.
 16. Adamawa HQ geofence target is fixed at 9.2781640, 12.432640 with a 50 m radius.
 17. Check-In now explicitly requests Android runtime location permission before starting a fresh GPS fix and waits up to 15 seconds for a live coordinate.
 18. Server Connection Google Form section has been removed.
