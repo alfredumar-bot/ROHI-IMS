@@ -1,0 +1,85 @@
+<DWPTScreen>:
+    MDScreen:
+        md_bg_color: 0.95, 0.95, 0.95, 1
+
+        MDBoxLayout:
+            orientation: "vertical"
+
+            MDTopAppBar:
+                title: "Daily/Weekly Performance Tracker (DWPT)"
+                elevation: 2
+                md_bg_color: 0.13, 0.40, 0.16, 1
+                specific_text_color: 1, 1, 1, 1
+                left_action_items: [["arrow-left", lambda x: app.open_dashboard()]]
+
+            ScrollView:
+                MDBoxLayout:
+                    orientation: "vertical"
+                    padding: dp(14)
+                    spacing: dp(10)
+                    size_hint_y: None
+                    height: self.minimum_height
+                    MDLabel:
+                        id: dwpt_staff
+                        text: "Reported By:"
+                        bold: True
+                        adaptive_height: True
+                    MDBoxLayout:
+                        adaptive_height: True
+                        spacing: dp(8)
+                        MDRaisedButton:
+                            text: "DAILY"
+                            on_release: app.set_dwpt_type("Daily")
+                        MDRaisedButton:
+                            text: "WEEKLY"
+                            on_release: app.set_dwpt_type("Weekly")
+                        MDLabel:
+                            id: dwpt_type
+                            text: "Daily"
+                            valign: "middle"
+                    MDTextField:
+                        id: dwpt_date
+                        hint_text: "Date / Week Ending"
+                    MDTextField:
+                        id: dwpt_state
+                        hint_text: "State Office"
+                        readonly: True
+                    MDTextField:
+                        id: dwpt_location
+                        hint_text: "Location / Town"
+                    MDTextField:
+                        id: dwpt_project
+                        hint_text: "Project"
+                    MDTextField:
+                        id: dwpt_activity
+                        hint_text: "Activity / Sub-Activity"
+                    MDTextField:
+                        id: dwpt_report
+                        hint_text: "Brief Daily / Weekly Performance Report"
+                        multiline: True
+                        size_hint_y: None
+                        height: dp(150)
+                    MDTextField:
+                        id: dwpt_achievement
+                        hint_text: "Key Achievement"
+                        multiline: True
+                        size_hint_y: None
+                        height: dp(90)
+                    MDTextField:
+                        id: dwpt_challenge
+                        hint_text: "Challenge / Issue (if any)"
+                        multiline: True
+                        size_hint_y: None
+                        height: dp(90)
+                    MDLabel:
+                        id: dwpt_photo_status
+                        text: "Photos: 0/2"
+                        theme_text_color: "Secondary"
+                        adaptive_height: True
+                    MDRaisedButton:
+                        text: "SELECT FROM GALLERY (MAX 2)"
+                        on_release: app.open_report_gallery("dwpt")
+                    MDRaisedButton:
+                        text: "SEND TO GOOGLE"
+                        md_bg_color: 0.13,0.40,0.16,1
+                        on_release: app.submit_dwpt()

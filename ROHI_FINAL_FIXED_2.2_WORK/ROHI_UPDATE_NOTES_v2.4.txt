@@ -1,0 +1,17 @@
+ROHI UPDATE NOTES v2.4
+
+- Changed State Office folder setup to SAFE / NON-DESTRUCTIVE mode.
+- setupStateOfficeFolders() no longer deletes or trashes any existing State Office folder.
+- Existing Timesheet and Leave reports are preserved.
+- Re-running setupStateOfficeFolders() only creates missing folders.
+- Kept backward-compatible resetStateOfficeTree_() wrapper, which is also non-destructive.
+- One Apps Script endpoint remains sufficient for all five State Offices.
+
+CFM v2.0 requested correction:
+- CFM Google template now has CFM Office Name, Noted, Case Document, Review by Management, and Status as the final column.
+- Case Document and Review by Management use dropdowns.
+- Status uses Open / Under Review / Closed and remains the final column.
+- Dashboard and CFM case management display Total / Open / Under Review / Closed in one compact row.
+- Sections 10 and 11 are locked until Closed is selected; final closure requires response date, respondent/complainant informed confirmation, and satisfaction selection.
+- Final staff closure update is written back to the central Google Sheet.
+- Existing local CFM data is preserved by safe schema migration.

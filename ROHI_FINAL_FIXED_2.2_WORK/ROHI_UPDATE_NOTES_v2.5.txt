@@ -1,0 +1,13 @@
+ROHI IMS v2.5 validation/fix update
+
+- Preserved the most recent v2.4 safe/non-destructive Google Drive folder setup.
+- Preserved CFM spreadsheet UID, DWPT root, Monthly Report root, Timesheet/Leave roots and shared Apps Script endpoint.
+- Google/report links remain usable while locked; locking prevents editing only. Connection test buttons remain usable.
+- Corrected report upload to use the saved endpoint configuration rather than silently ignoring a changed endpoint.
+- Corrected upload endpoint count to report all 7 configured report endpoints.
+- Navigation drawer now follows the requested order after Staff Registration: DWPT #2, Attendance #3, Timesheet #4, Leave #5, Monthly Report #6, CFM #7, Settings #8. Removed redundant drawer entries that shifted the numbering.
+- DWPT and Monthly Report remain navigation-only and are not added as dashboard cards.
+- Leave export naming now follows the same initial+surname/state/month pattern as Timesheet.
+- CFM Type of Complaint / Feedback uses focus-triggered dropdown opening for reliable touch operation.
+- Added remote CFM status synchronization from the central Apps Script so Google Sheet changes (Open/Under Review/Closed) are applied to the local dashboard/CFM counts.
+- Existing folders, reports and local data are not deleted by these changes.
