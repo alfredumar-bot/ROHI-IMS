@@ -6,13 +6,13 @@ package.domain = org.rohi
 source.dir = .
 source.include_exts = py,png,jpg,jpeg,kv,atlas,db,ttf,json,xlsx
 
-version = 2.0
+version = 2.1
 
 # Keep package.name/package.domain unchanged and rebuild with the same
 # signing key each release (CI's cached debug keystore already does this
 # automatically) so the installer updates the app in place, no uninstall
 # needed. android.numeric_version must strictly increase on every release.
-android.numeric_version = 6
+android.numeric_version = 7
 
 
 # kivymd is pinned to 1.2.0 to match what the app was built/tested against

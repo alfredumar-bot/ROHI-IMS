@@ -100,7 +100,7 @@ CHECKOUT_REMINDER_OFFSETS_MINUTES = [
 # Single source of truth for the app version shown in Settings. Keep this in
 # sync with the `version =` line in buildozer.spec every time you release an
 # update, so what's displayed on-screen always matches the installed build.
-APP_VERSION = "2.0"
+APP_VERSION = "2.1"
 
 # Dashboard quick links supplied by ROHI. Empty URLs intentionally show a
 # "link will be provided shortly" message until production links are supplied.
@@ -380,6 +380,8 @@ from kivy.utils import platform
 from kivy.metrics import dp
 from kivy.core.window import Window
 from kivy.properties import NumericProperty, StringProperty, BooleanProperty
+from kivy.uix.image import Image
+from kivy.uix.behaviors import ButtonBehavior
 
 # Makes Kivy pan the screen so the focused text field stays visible above the
 # on-screen keyboard, instead of the keyboard covering it (was hiding the
@@ -537,7 +539,7 @@ STATE_OFFICES = [
 ]
 
 OFFICES = {
-    "Borno State Office": {"latitude": 11.806576, "longitude": 13.117692, "radius": 30},
+    "Borno State Office": {"latitude": 11.798630, "longitude": 13.145316, "radius": 30},
     "Adamawa HQ": {"latitude": 9.2781640, "longitude": 12.432640, "radius": 30},
     "Yobe State Office": {"latitude": 11.7460, "longitude": 11.9660, "radius": 30},
     "Taraba State Office": {"latitude": 8.8936, "longitude": 11.3595, "radius": 30},
@@ -570,6 +572,13 @@ REQUIRED_REGISTRATION_FIELDS = [
 ]
 
 
+class TikTokButton(ButtonBehavior, Image):
+    """Image-based TikTok button so the dashboard uses the real logo asset
+    instead of a generic music-note Material Design icon.  ButtonBehavior
+    keeps the control lightweight and compatible with KivyMD 1.2.0."""
+    pass
+
+
 class SplashScreen(MDScreen):
     pass
 
@@ -585,6 +594,14 @@ class ROHIAttendanceApp(MDApp):
     # buildozer.spec's `version =` line) together on every release.
     app_version = StringProperty(APP_VERSION)
     google_links_unlocked = BooleanProperty(False)
+
+    # Exposes the module-level ROHI_EXTERNAL_LINKS dict as app.ROHI_EXTERNAL_LINKS
+    # so .kv on_release callbacks can reach it reliably. KV rule callbacks are
+    # not guaranteed to see plain module globals, but every KV file already
+    # has access to the running App instance as `app` - going through that is
+    # the same pattern used by every other callback in this codebase (e.g.
+    # app.open_external_link, app.open_dashboard).
+    ROHI_EXTERNAL_LINKS = ROHI_EXTERNAL_LINKS
 
     # Safe-area insets (in dp) for the status bar / display cutout and the
     # bottom gesture-navigation bar. These differ a lot between phones (a
@@ -705,19 +722,31 @@ class ROHIAttendanceApp(MDApp):
         # not changed by stale per-device settings.
         self.GEOFENCE_RADIUS_METERS = 30
 
-        # Load KV Files safely
-        try:
-            kv_files = ["splash.kv", "login.kv", "registration.kv", "dashboard.kv",
-                        "reports.kv", "timesheet.kv", "leave.kv", "cfm.kv", "dwpt.kv", "monthly_report.kv", "settings.kv", "server_connection.kv"]
-            for kv_name in kv_files:
-                kv_file = os.path.join(APP_DIR, kv_name)
+        # Load KV Files safely. Each file is loaded in its own try/except -
+        # previously all 12 files were loaded inside a single try/except
+        # around the whole loop, so a parse failure in ANY one file (e.g. a
+        # bad .kv syntax) silently aborted the loop and left every file
+        # *after* it in this list completely unloaded - not just broken, but
+        # with zero styling/ids at all (their MDScreens render with default
+        # white backgrounds, and any code doing ids.some_widget on them
+        # crashes with an AttributeError, since ids is simply empty).
+        kv_files = ["splash.kv", "login.kv", "registration.kv", "dashboard.kv",
+                    "reports.kv", "timesheet.kv", "leave.kv", "cfm.kv", "dwpt.kv", "monthly_report.kv", "settings.kv", "server_connection.kv"]
+        failed_kv_files = []
+        for kv_name in kv_files:
+            kv_file = os.path.join(APP_DIR, kv_name)
+            try:
                 if os.path.exists(kv_file):
                     Builder.load_file(kv_file)
                 else:
                     raise FileNotFoundError(f"Missing KV file: {kv_file}")
+            except Exception:
+                failed_kv_files.append(kv_name)
+                logger.exception(f"Failed to load KV file '{kv_name}' - continuing with the rest:")
+        if failed_kv_files:
+            logger.error(f"KV layout files that failed to load: {failed_kv_files}. Affected screens will be unstyled/broken.")
+        else:
             logger.info("KV layout files loaded successfully.")
-        except Exception:
-            logger.exception("Failed to load KV layout files:")
 
         sm = MDScreenManager()
         # No-Transition instead of the default Slide/Fade transition.
@@ -778,8 +807,31 @@ class ROHIAttendanceApp(MDApp):
         # Silent background sync - pushes any pending rows to the server
         # every AUTO_SYNC_INTERVAL_SECONDS without needing "Synchronize Now".
         Clock.schedule_interval(self._auto_sync_tick, AUTO_SYNC_INTERVAL_SECONDS)
+        # Restore the persistent DB connection (if a link was already
+        # configured/saved) shortly after launch, instead of only on the
+        # first periodic tick 3 minutes later - otherwise the Dashboard/
+        # Settings "connected" status sits on "NOT CONNECTED" for the first
+        # 3 minutes of every single launch even when a working link is saved.
+        Clock.schedule_once(lambda dt: self._auto_sync_tick(), 4)
+        # Likewise, auto-test the configured Excel report links shortly after
+        # launch so the dashboard's "Excel Sync: x/7 CONNECTED" badge reflects
+        # reality immediately, instead of always starting on "NOT CONNECTED"
+        # until the user manually opens Settings and tests each link.
+        Clock.schedule_once(lambda dt: self._auto_connect_excel_links(), 4)
 
         return sm
+
+    def _auto_connect_excel_links(self):
+        """Test each configured Excel report link in the background at
+        startup (and update the dashboard badge as each result comes in),
+        without requiring the user to manually visit Settings first."""
+        for report_type in ("attendance", "timesheet", "leave", "staff", "cfm", "dwpt", "monthly_report"):
+            try:
+                url = str(self._excel_sync_state.get(f"{report_type}_link") or "").strip()
+                if url.startswith(("http://", "https://")):
+                    self.connect_excel_report(report_type)
+            except Exception:
+                logger.exception(f"Auto-connect failed for {report_type} Excel link:")
 
     def on_start(self):
         """Dropdown menu fields are opened via on_focus handlers declared directly
@@ -1426,19 +1478,31 @@ class ROHIAttendanceApp(MDApp):
         """Re-lock the Google link/endpoint fields. No password required to lock."""
         self.google_links_unlocked = False
 
-
+    def open_settings_screen(self):
+        """Navigate to the app's own Settings screen (not Kivy's built-in config panel)."""
         self._dismiss_active_menu()
+        self._refresh_connection_status_labels()
         if hasattr(self, "settings_screen") and hasattr(self.settings_screen, "ids"):
-            if "server_status_label" in self.settings_screen.ids:
-                status = pg_sync.get_status()
-                state = "Connected" if status["connected"] else "Not connected"
-                lbl = self.settings_screen.ids.server_status_label
-                lbl.text = f"{state} · {status['pending_count']} record(s) pending sync"
-                lbl.theme_text_color = "Custom"
-                lbl.text_color = (0.1, 0.6, 0.2, 1) if status["connected"] else (0.6, 0.15, 0.15, 1)
             if "reminders_switch" in self.settings_screen.ids:
                 self.settings_screen.ids.reminders_switch.active = self._load_reminders_enabled()
         self.root.current = "settings"
+
+    def _refresh_connection_status_labels(self):
+        """Updates the Settings screen's DB connection status label from
+        pg_sync's live state. Called both when the user opens Settings and
+        right after a background auto-connect/auto-sync attempt completes,
+        so the label reflects reality without needing a manual screen visit."""
+        try:
+            if hasattr(self, "settings_screen") and hasattr(self.settings_screen, "ids"):
+                if "server_status_label" in self.settings_screen.ids:
+                    status = pg_sync.get_status()
+                    state = "Connected" if status["connected"] else "Not connected"
+                    lbl = self.settings_screen.ids.server_status_label
+                    lbl.text = f"{state} · {status['pending_count']} record(s) pending sync"
+                    lbl.theme_text_color = "Custom"
+                    lbl.text_color = (0.1, 0.6, 0.2, 1) if status["connected"] else (0.6, 0.15, 0.15, 1)
+        except Exception:
+            logger.exception("Could not refresh connection status label:")
 
     def open_server_connection(self):
         self._dismiss_active_menu()
@@ -1546,6 +1610,11 @@ class ROHIAttendanceApp(MDApp):
     def connect_excel_report(self, report_type):
         """Test one report link in the background and show green/red status."""
         url = str(self._excel_sync_state.get(f"{report_type}_link") or "").strip()
+        # CFM may be configured with an Apps Script endpoint before a separate
+        # Drive/Sheet browse link is supplied. Test the protected endpoint in
+        # that case without exposing or changing the stored database settings.
+        if report_type == "cfm" and not url:
+            url = str(self._excel_sync_state.get("cfm_endpoint") or "").strip()
         if not url.startswith(("http://", "https://")):
             self._set_excel_link_status(report_type, False, f"{report_type.title()} link is missing or invalid.")
             return
@@ -1575,11 +1644,15 @@ class ROHIAttendanceApp(MDApp):
             "leave_link_field": "leave_link",
             "staff_link_field": "staff_link",
             "cfm_link_field": "cfm_link",
+            "dwpt_link_field": "dwpt_link",
+            "monthly_report_link_field": "monthly_report_link",
             "attendance_endpoint_field": "attendance_endpoint",
             "timesheet_endpoint_field": "timesheet_endpoint",
             "leave_endpoint_field": "leave_endpoint",
             "staff_endpoint_field": "staff_endpoint",
             "cfm_endpoint_field": "cfm_endpoint",
+            "dwpt_endpoint_field": "dwpt_endpoint",
+            "monthly_report_endpoint_field": "monthly_report_endpoint",
         }
         for widget_id, key in mapping.items():
             if widget_id in ids:
@@ -1598,11 +1671,15 @@ class ROHIAttendanceApp(MDApp):
             "leave_link_field": "leave_link",
             "staff_link_field": "staff_link",
             "cfm_link_field": "cfm_link",
+            "dwpt_link_field": "dwpt_link",
+            "monthly_report_link_field": "monthly_report_link",
             "attendance_endpoint_field": "attendance_endpoint",
             "timesheet_endpoint_field": "timesheet_endpoint",
             "leave_endpoint_field": "leave_endpoint",
             "staff_endpoint_field": "staff_endpoint",
             "cfm_endpoint_field": "cfm_endpoint",
+            "dwpt_endpoint_field": "dwpt_endpoint",
+            "monthly_report_endpoint_field": "monthly_report_endpoint",
         }
         for widget_id, key in mapping.items():
             if widget_id in ids:
@@ -1789,7 +1866,8 @@ class ROHIAttendanceApp(MDApp):
     def connect_excel_sync(self):
         data = self._collect_excel_sync_form()
         links = [data.get(k, "") for k in (
-            "attendance_link", "timesheet_link", "leave_link", "staff_link"
+            "attendance_link", "timesheet_link", "leave_link", "staff_link",
+            "cfm_link", "dwpt_link", "monthly_report_link"
         )]
         valid = all(u.startswith(("http://", "https://")) for u in links if u)
         if not valid:
@@ -1802,8 +1880,8 @@ class ROHIAttendanceApp(MDApp):
             "attendance_endpoint", "timesheet_endpoint", "leave_endpoint", "staff_endpoint"
         ))
         message = (
-            f"Connected: {len([u for u in links if u])}/4 report links saved. "
-            f"{endpoint_count}/4 upload endpoints configured."
+            f"Connected: {len([u for u in links if u])}/7 report links saved. "
+            f"{endpoint_count}/7 upload endpoints configured."
         )
         if hasattr(self.server_connection_screen.ids, "excel_sync_result_label"):
             self.server_connection_screen.ids.excel_sync_result_label.text = message
@@ -1835,11 +1913,11 @@ class ROHIAttendanceApp(MDApp):
             statuses = self._excel_sync_state.get("link_status", {})
             connected_count = sum(bool(statuses.get(k, False)) for k in ("attendance", "timesheet", "leave", "staff"))
             if "excel_sync_status" in ids:
-                if connected_count == 4:
-                    ids.excel_sync_status.text = "Excel Sync: CONNECTED (4/4)"
+                if connected_count == 7:
+                    ids.excel_sync_status.text = "Excel Sync: CONNECTED (7/7)"
                     ids.excel_sync_status.text_color = (0.13, 0.40, 0.16, 1)
                 elif connected_count > 0:
-                    ids.excel_sync_status.text = f"Excel Sync: {connected_count}/4 CONNECTED"
+                    ids.excel_sync_status.text = f"Excel Sync: {connected_count}/7 CONNECTED"
                     ids.excel_sync_status.text_color = (0.75, 0.55, 0.05, 1)
                 else:
                     ids.excel_sync_status.text = "Excel Sync: NOT CONNECTED"
@@ -3324,11 +3402,20 @@ class ROHIAttendanceApp(MDApp):
         except Exception:
             logger.exception("Google Form auto-sync tick failed:")
 
-    @staticmethod
-    def _auto_sync_worker(config):
+    def _auto_sync_worker(self, config):
         try:
-            ok, message, counts = pg_sync.synchronize_now(config)
-            logger.info("Auto-sync: ok=%s message=%s counts=%s", ok, message, counts)
+            if not pg_sync.is_connected():
+                # Establishes the persistent connection (used by the
+                # Settings "Connected"/"Not connected" status and by
+                # Synchronize Now), not just a one-off sync - otherwise the
+                # status label stays stuck on "Not connected" forever even
+                # though data is quietly syncing fine in the background.
+                ok, message = pg_sync.connect(config, auto_sync=True)
+                logger.info("Auto-connect: ok=%s message=%s", ok, message)
+            else:
+                ok, message, counts = pg_sync.synchronize_now(config)
+                logger.info("Auto-sync: ok=%s message=%s counts=%s", ok, message, counts)
+            Clock.schedule_once(lambda dt: self._refresh_connection_status_labels(), 0)
         except Exception:
             logger.exception("Background auto-sync failed:")
 
@@ -5666,11 +5753,21 @@ class ROHIAttendanceApp(MDApp):
     def open_dwpt(self):
         if not self.current_user:
             self.root.current = 'login'; return
-        self.root.current = 'dwpt'
-        ids = self.dwpt_screen.ids
-        ids.dwpt_staff.text = f"Reported By: {self.current_user[1]}"
-        ids.dwpt_state.text = self._registered_state_office()
-        ids.dwpt_date.text = datetime.now().strftime('%Y-%m-%d')
+        try:
+            screen = self.dwpt_screen
+            ids = screen.ids
+            required = ("dwpt_staff", "dwpt_state", "dwpt_date")
+            missing = [name for name in required if name not in ids]
+            if missing:
+                raise RuntimeError(f"DWPT KV IDs missing: {missing}")
+            self.root.current = 'dwpt'
+            ids.dwpt_staff.text = f"Reported By: {self.current_user[1]}"
+            ids.dwpt_state.text = self._registered_state_office()
+            ids.dwpt_date.text = datetime.now().strftime('%Y-%m-%d')
+        except Exception:
+            logger.exception("Unable to open Daily/Weekly Performance Tracker - returning to dashboard.")
+            self.show_link_pending("Daily/Weekly Performance Tracker")
+            self.open_dashboard()
 
     def set_dwpt_type(self, value):
         self.dwpt_screen.ids.dwpt_type.text = value
@@ -5678,10 +5775,20 @@ class ROHIAttendanceApp(MDApp):
     def open_monthly_report(self):
         if not self.current_user:
             self.root.current = 'login'; return
-        self.root.current = 'monthly_report'
-        ids = self.monthly_report_screen.ids
-        ids.monthly_staff.text = f"Reported By: {self.current_user[1]}"
-        ids.monthly_date.text = datetime.now().strftime('%Y-%m-%d')
+        try:
+            screen = self.monthly_report_screen
+            ids = screen.ids
+            required = ("monthly_staff", "monthly_date")
+            missing = [name for name in required if name not in ids]
+            if missing:
+                raise RuntimeError(f"Monthly Report KV IDs missing: {missing}")
+            self.root.current = 'monthly_report'
+            ids.monthly_staff.text = f"Reported By: {self.current_user[1]}"
+            ids.monthly_date.text = datetime.now().strftime('%Y-%m-%d')
+        except Exception:
+            logger.exception("Unable to open Monthly Report - returning to dashboard.")
+            self.show_link_pending("Monthly Report")
+            self.open_dashboard()
 
     def open_report_gallery(self, kind):
         limit = 2 if kind == 'dwpt' else 4

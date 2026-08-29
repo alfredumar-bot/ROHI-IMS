@@ -9,7 +9,7 @@
                 title: "Server Connection"
                 elevation: 2
                 md_bg_color: 0.13, 0.40, 0.16, 1
-                left_action_items: [["arrow-left", lambda x: app.lock_google_links() or app.open_settings()]]
+                left_action_items: [["arrow-left", lambda x: app.lock_google_links() or app.open_settings_screen()]]
 
             ScrollView:
                 do_scroll_x: False
@@ -220,9 +220,7 @@
 
                         MDTextField:
                             id: attendance_link_field
-                                                        disabled: not app.google_links_unlocked
-                            opacity: 1
-hint_text: "ROHI Attendance Report link"
+                            hint_text: "ROHI Attendance Report link"
                             multiline: True
                             size_hint_y: None
                             height: dp(64)
@@ -272,9 +270,7 @@ hint_text: "ROHI Attendance Report link"
 
                         MDTextField:
                             id: attendance_endpoint_field
-                                                        disabled: not app.google_links_unlocked
-                            opacity: 1
-hint_text: "Attendance automatic upload endpoint (required for Send to Google)"
+                            hint_text: "Attendance automatic upload endpoint (required for Send to Google)"
                             multiline: True
                             size_hint_y: None
                             height: dp(64)
@@ -283,9 +279,7 @@ hint_text: "Attendance automatic upload endpoint (required for Send to Google)"
 
                         MDTextField:
                             id: timesheet_link_field
-                                                        disabled: not app.google_links_unlocked
-                            opacity: 1
-hint_text: "ROHI Timesheet folder/link"
+                            hint_text: "ROHI Timesheet folder/link"
                             multiline: True
                             size_hint_y: None
                             height: dp(64)
@@ -335,9 +329,7 @@ hint_text: "ROHI Timesheet folder/link"
 
                         MDTextField:
                             id: timesheet_endpoint_field
-                                                        disabled: not app.google_links_unlocked
-                            opacity: 1
-hint_text: "Timesheet automatic upload endpoint (required for Send to Google)"
+                            hint_text: "Timesheet automatic upload endpoint (required for Send to Google)"
                             multiline: True
                             size_hint_y: None
                             height: dp(64)
@@ -346,9 +338,7 @@ hint_text: "Timesheet automatic upload endpoint (required for Send to Google)"
 
                         MDTextField:
                             id: leave_link_field
-                                                        disabled: not app.google_links_unlocked
-                            opacity: 1
-hint_text: "ROHI Leave Management folder/link"
+                            hint_text: "ROHI Leave Management folder/link"
                             multiline: True
                             size_hint_y: None
                             height: dp(64)
@@ -398,9 +388,7 @@ hint_text: "ROHI Leave Management folder/link"
 
                         MDTextField:
                             id: leave_endpoint_field
-                                                        disabled: not app.google_links_unlocked
-                            opacity: 1
-hint_text: "Leave automatic upload endpoint (required for Send to Google)"
+                            hint_text: "Leave automatic upload endpoint (required for Send to Google)"
                             multiline: True
                             size_hint_y: None
                             height: dp(64)
@@ -409,9 +397,7 @@ hint_text: "Leave automatic upload endpoint (required for Send to Google)"
 
                         MDTextField:
                             id: staff_link_field
-                                                        disabled: not app.google_links_unlocked
-                            opacity: 1
-hint_text: "ROHI Complete Staff on IMS link"
+                            hint_text: "ROHI Complete Staff on IMS link"
                             multiline: True
                             size_hint_y: None
                             height: dp(64)
@@ -461,9 +447,7 @@ hint_text: "ROHI Complete Staff on IMS link"
 
                         MDTextField:
                             id: cfm_link_field
-                                                        disabled: not app.google_links_unlocked
-                            opacity: 1
-hint_text: "ROHI CFM Excel / Google Sheet link"
+                            hint_text: "ROHI CFM Excel / Google Sheet link"
                             multiline: True
                             size_hint_y: None
                             height: dp(64)
@@ -513,9 +497,7 @@ hint_text: "ROHI CFM Excel / Google Sheet link"
 
                         MDTextField:
                             id: cfm_endpoint_field
-                                                        disabled: not app.google_links_unlocked
-                            opacity: 1
-hint_text: "CFM automatic upload endpoint (same Google Apps Script /exec link)"
+                            hint_text: "CFM automatic upload endpoint (same Google Apps Script /exec link)"
                             multiline: True
                             size_hint_y: None
                             height: dp(64)
@@ -571,9 +553,7 @@ hint_text: "CFM automatic upload endpoint (same Google Apps Script /exec link)"
 
                         MDTextField:
                             id: staff_endpoint_field
-                                                        disabled: not app.google_links_unlocked
-                            opacity: 1
-hint_text: "Staff automatic upload endpoint (required for Send to Google)"
+                            hint_text: "Staff automatic upload endpoint (required for Send to Google)"
                             multiline: True
                             size_hint_y: None
                             height: dp(64)
@@ -645,9 +625,7 @@ hint_text: "Staff automatic upload endpoint (required for Send to Google)"
 
                         MDTextField:
                             id: dhis2_server_url
-                                                        disabled: not app.google_links_unlocked
-                            opacity: 1
-hint_text: "Server URL (e.g. https://play.dhis2.org/40.0.0)"
+                            hint_text: "Server URL (e.g. https://play.dhis2.org/40.0.0)"
                             size_hint_y: None
                             height: dp(48)
 
