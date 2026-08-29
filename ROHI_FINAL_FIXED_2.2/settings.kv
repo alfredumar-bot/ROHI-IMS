@@ -1,0 +1,328 @@
+<SettingsScreen>:
+    MDScreen:
+        md_bg_color: 0.95, 0.95, 0.95, 1
+
+        MDBoxLayout:
+            orientation: 'vertical'
+
+            MDTopAppBar:
+                title: "Settings"
+                elevation: 2
+                md_bg_color: 0.13, 0.40, 0.16, 1
+                left_action_items: [["arrow-left", lambda x: app.open_dashboard()]]
+
+            ScrollView:
+                do_scroll_x: False
+
+                MDBoxLayout:
+                    orientation: 'vertical'
+                    padding: dp(16)
+                    spacing: dp(16)
+                    size_hint_y: None
+                    height: self.minimum_height
+
+                    # ---------------- Server Connection ----------------
+                    MDCard:
+                        orientation: 'vertical'
+                        padding: dp(16)
+                        spacing: dp(10)
+                        size_hint_y: None
+                        height: self.minimum_height
+                        radius: [12,]
+                        elevation: 2
+
+                        MDBoxLayout:
+                            spacing: dp(8)
+                            adaptive_height: True
+
+                            MDIcon:
+                                icon: "server-network"
+                                theme_text_color: "Custom"
+                                text_color: 0.18, 0.49, 0.20, 1
+
+                            MDLabel:
+                                text: "Server Connection"
+                                bold: True
+                                font_style: "Subtitle1"
+                                adaptive_height: True
+
+                        MDLabel:
+                            id: server_status_label
+                            text: "Not connected"
+                            font_style: "Caption"
+                            theme_text_color: "Secondary"
+                            adaptive_height: True
+
+                        MDLabel:
+                            text: "Excel Auto-Sync is configured in Server Connection."
+                            font_style: "Caption"
+                            theme_text_color: "Secondary"
+                            adaptive_height: True
+
+                        MDRaisedButton:
+                            text: "OPEN SERVER CONNECTION"
+                            md_bg_color: 0.13, 0.40, 0.16, 1
+                            on_release: app.open_server_connection()
+
+                    # ---------------- Complaints & Feedback (CFM) ----------------
+                    MDCard:
+                        orientation: 'vertical'
+                        padding: dp(16)
+                        spacing: dp(10)
+                        size_hint_y: None
+                        height: self.minimum_height
+                        radius: [12,]
+                        elevation: 2
+
+                        MDBoxLayout:
+                            spacing: dp(8)
+                            adaptive_height: True
+
+                            MDIcon:
+                                icon: "comment-alert-outline"
+                                theme_text_color: "Custom"
+                                text_color: 0.18, 0.49, 0.20, 1
+
+                            MDLabel:
+                                text: "Complaints & Feedback (CFM)"
+                                bold: True
+                                font_style: "Subtitle1"
+                                adaptive_height: True
+
+                        MDLabel:
+                            text: "Submit or review Community & Office Level complaints and feedback cases."
+                            font_style: "Caption"
+                            theme_text_color: "Secondary"
+                            adaptive_height: True
+                            text_size: self.width, None
+
+                        MDRaisedButton:
+                            text: "OPEN CFM"
+                            md_bg_color: 0.13, 0.40, 0.16, 1
+                            on_release: app.open_cfm()
+
+                    # ---------------- Notifications ----------------
+                    MDCard:
+                        orientation: 'vertical'
+                        padding: dp(16)
+                        spacing: dp(10)
+                        size_hint_y: None
+                        height: self.minimum_height
+                        radius: [12,]
+                        elevation: 2
+
+                        MDBoxLayout:
+                            spacing: dp(8)
+                            adaptive_height: True
+
+                            MDIcon:
+                                icon: "bell-ring-outline"
+                                theme_text_color: "Custom"
+                                text_color: 0.18, 0.49, 0.20, 1
+
+                            MDLabel:
+                                text: "Notifications"
+                                bold: True
+                                font_style: "Subtitle1"
+                                adaptive_height: True
+
+                        MDLabel:
+                            text: "Controls the 07:50 / 07:55 / 07:59 Check-In and 15:50-series Check-Out reminder alerts."
+                            font_style: "Caption"
+                            theme_text_color: "Secondary"
+                            adaptive_height: True
+
+                        MDBoxLayout:
+                            spacing: dp(8)
+                            adaptive_height: True
+
+                            MDLabel:
+                                text: "Attendance Reminder Notifications"
+                                adaptive_height: True
+                                pos_hint: {'center_y': 0.5}
+
+                            MDSwitch:
+                                id: reminders_switch
+                                active: True
+                                pos_hint: {'center_y': 0.5}
+                                on_active: app.toggle_reminder_notifications(self.active)
+
+                        MDRaisedButton:
+                            text: "OPEN NOTIFICATION SETTINGS"
+                            md_bg_color: 0.13, 0.40, 0.16, 1
+                            on_release: app.open_notification_settings()
+
+                    # ---------------- Reset Database ----------------
+                    MDCard:
+                        orientation: 'vertical'
+                        padding: dp(16)
+                        spacing: dp(10)
+                        size_hint_y: None
+                        height: self.minimum_height
+                        radius: [12,]
+                        elevation: 2
+
+                        MDBoxLayout:
+                            spacing: dp(8)
+                            adaptive_height: True
+
+                            MDIcon:
+                                icon: "database-remove-outline"
+                                theme_text_color: "Custom"
+                                text_color: 0.8, 0.1, 0.1, 1
+
+                            MDLabel:
+                                text: "Reset Database"
+                                bold: True
+                                font_style: "Subtitle1"
+                                adaptive_height: True
+
+                        MDLabel:
+                            text: "Permanently deletes all local staff and attendance records on this device. Server config is not affected."
+                            font_style: "Caption"
+                            theme_text_color: "Secondary"
+                            adaptive_height: True
+
+                        MDLabel:
+                            id: reset_status_label
+                            text: ""
+                            font_style: "Caption"
+                            theme_text_color: "Secondary"
+                            adaptive_height: True
+
+                        MDRaisedButton:
+                            text: "RESET DATABASE"
+                            md_bg_color: 0.8, 0.1, 0.1, 1
+                            on_release: app.confirm_reset_database()
+
+                    # ---------------- Backup & Restore (kept below Reset Database) ----------------
+                    MDCard:
+                        orientation: 'vertical'
+                        padding: dp(16)
+                        spacing: dp(10)
+                        size_hint_y: None
+                        height: self.minimum_height
+                        radius: [12,]
+                        elevation: 2
+
+                        MDBoxLayout:
+                            spacing: dp(8)
+                            adaptive_height: True
+
+                            MDIcon:
+                                icon: "database-export-outline"
+                                theme_text_color: "Custom"
+                                text_color: 0.18, 0.49, 0.20, 1
+
+                            MDLabel:
+                                text: "Backup & Restore"
+                                bold: True
+                                font_style: "Subtitle1"
+                                adaptive_height: True
+
+                        MDLabel:
+                            text: "Move ROHI to a new phone by exporting one backup file. It contains staff registration, attendance, leave, CFM cases, saved connection settings and staff photos/signatures. The old login session is not included."
+                            font_style: "Caption"
+                            theme_text_color: "Secondary"
+                            adaptive_height: True
+                            text_size: self.width, None
+
+                        MDLabel:
+                            text: "Warning: the backup contains sensitive staff and case information. Store it securely."
+                            font_style: "Caption"
+                            theme_text_color: "Custom"
+                            text_color: 0.75, 0.12, 0.12, 1
+                            adaptive_height: True
+                            text_size: self.width, None
+
+                        MDBoxLayout:
+                            spacing: dp(8)
+                            adaptive_height: True
+
+                            MDRaisedButton:
+                                text: "EXPORT BACKUP"
+                                md_bg_color: 0.13, 0.40, 0.16, 1
+                                size_hint_x: 0.5
+                                on_release: app.export_full_backup()
+
+                            MDRaisedButton:
+                                text: "IMPORT BACKUP"
+                                md_bg_color: 0.13, 0.40, 0.16, 1
+                                size_hint_x: 0.5
+                                on_release: app.import_full_backup()
+
+                        MDLabel:
+                            id: backup_status_label
+                            text: "No backup action performed."
+                            font_style: "Caption"
+                            theme_text_color: "Custom"
+                            text_color: 0.35, 0.35, 0.35, 1
+                            adaptive_height: True
+                            text_size: self.width, None
+
+                    # ---------------- App Version ----------------
+                    MDBoxLayout:
+                        orientation: 'horizontal'
+                        spacing: dp(8)
+                        adaptive_height: True
+                        padding: [dp(4), dp(6), dp(4), dp(6)]
+
+                        MDIcon:
+                            icon: "information-outline"
+                            theme_text_color: "Secondary"
+                            pos_hint: {'center_y': 0.5}
+
+                        MDLabel:
+                            text: f"Version {app.app_version}"
+                            font_style: "Caption"
+                            theme_text_color: "Secondary"
+                            adaptive_height: True
+                            pos_hint: {'center_y': 0.5}
+
+            # ---------------- Footer credit (fixed at bottom, centered, single line) ----------------
+            MDBoxLayout:
+                orientation: 'horizontal'
+                spacing: dp(6)
+                size_hint_y: None
+                height: dp(36)
+                padding: [0, dp(6), 0, dp(10)]
+
+                Widget:
+
+                MDBoxLayout:
+                    size_hint: None, None
+                    size: dp(18), dp(18)
+                    pos_hint: {'center_y': 0.5}
+
+                    canvas.before:
+                        Color:
+                            rgba: 0.83, 0.68, 0.21, 1
+                        Ellipse:
+                            pos: self.pos
+                            size: self.size
+
+                    MDLabel:
+                        text: "F"
+                        bold: True
+                        font_size: "11sp"
+                        theme_text_color: "Custom"
+                        text_color: 0, 0, 0, 1
+                        halign: "center"
+                        valign: "middle"
+                        adaptive_size: True
+                        text_size: None, None
+                        pos_hint: {'center_x': 0.5, 'center_y': 0.5}
+
+                MDLabel:
+                    text: "Designed by Fred Umar"
+                    bold: False
+                    font_size: "10sp"
+                    theme_text_color: "Custom"
+                    text_color: 0, 0, 0, 1
+                    halign: "left"
+                    valign: "middle"
+                    adaptive_size: True
+                    text_size: None, None
+                    pos_hint: {'center_y': 0.5}
+
+                Widget:

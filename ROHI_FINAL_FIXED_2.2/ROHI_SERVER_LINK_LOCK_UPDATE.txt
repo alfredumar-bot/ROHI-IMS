@@ -1,0 +1,5 @@
+ROHI Server Link Security Update
+
+All Google/report links and upload endpoints on Server Connection are administrator-locked using the same Reset Database password mechanism. This includes Attendance, Timesheet, Leave, Staff, CFM, Google Form and DHIS2 server URL.
+
+Links remain disabled until UNLOCK GOOGLE LINKS is authenticated. After Excel link settings are saved, the screen automatically re-locks. Existing Drive folders and reports are not deleted by this change.

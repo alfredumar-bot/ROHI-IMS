@@ -1,0 +1,32 @@
+ROHI Attendance v2.1 fixes
+
+1. Geofence
+- All configured offices use a strict 30 metre radius.
+- Borno State Office fixed coordinate: 11.806576 N, 13.117692 E.
+- Check-In and Check-Out use the fixed office coordinate as the target.
+- The phone's current GPS remains the live moving coordinate.
+
+2. Fresh Check-Out GPS
+- Android Check-Out no longer accepts last-known location.
+- A new LocationManager update must arrive after Check-Out starts.
+- This prevents Check-In GPS from being reused for Check-Out.
+
+3. Dashboard summary
+- Replaced the single Absent summary with four cards: Present, Absent, Punctuality, Late Records.
+- Present count is populated from captured attendance records.
+
+4. Reset Database protection
+- Reset Database requires the exact administrator password: Rohi@3313@
+- Incorrect password does not reset or delete anything.
+- Correct password clears local attendance history while preserving registered staff and server configuration.
+
+5. Reports
+- Opening Reports no longer automatically generates a report file.
+- Local report files are generated only after pressing a report/export button.
+- Existing Google/Apps Script links and manual SEND TO GOOGLE EXCEL actions are preserved.
+- Background Excel workbook generation was disabled to reduce Android/Pydroid crashes.
+- Direct attendance endpoint submission remains available for check-in/check-out.
+
+6. Friday/weekend attendance
+- Information Management and Security sections are allowed to check in/out Friday, Saturday and Sunday.
+- Combined labels containing "INFORMATION MANAGEMENT" or "SECURITY" are recognized.

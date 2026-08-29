@@ -1,0 +1,7221 @@
+import os
+import sys
+import json
+import sqlite3
+import math
+import random
+import re
+import logging
+import calendar
+import threading
+import time
+import shutil
+import zipfile
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
+from datetime import datetime, timedelta
+import ssl
+
+# -------------------------------------------------------------
+# AUTOMATIC LOG FILE GENERATOR
+# -------------------------------------------------------------
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR = os.path.join(APP_DIR, "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, "rohi_app.log")
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE, mode='a', encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+logger = logging.getLogger("ROHIApp")
+logger.info("==========================================")
+logger.info(f"ROHI Attendance App Starting at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+logger.info("==========================================")
+
+# -------------------------------------------------------------
+# Attendance report export protection
+# -------------------------------------------------------------
+# Password applied to exported attendance .xlsx reports (open-to-view lock).
+REPORT_EXPORT_PASSWORD = "Rohi@3313@"
+
+# Full-device migration backup. The backup contains the local SQLite database,
+# saved connection/sync settings, and staff photo/signature folders. The active
+# login session is deliberately excluded so a backup can safely be moved to a
+# different phone without silently authenticating the old session.
+BACKUP_VERSION = "1.0"
+BACKUP_EXCLUDED_FILES = {"session.json", "rohi_app.log"}
+BACKUP_CONFIG_FILES = [
+    "app_settings.json", "server_config.json", "excel_sync_config.json",
+    "dhis2_sync_config.json", "dhis2_tei_map.json", "gform_config.json"
+]
+BACKUP_DATA_DIRS = ["staff_photos", "staff_signatures"]
+
+# -------------------------------------------------------------
+# HTTPS certificate verification.
+# Some stripped-down Android Python builds do not wire up
+# the OS certificate store to Python's ssl module, so a plain urlopen() to
+# any https:// endpoint fails with CERTIFICATE_VERIFY_FAILED even though
+# the site's certificate is perfectly valid. certifi ships an up-to-date,
+# independent CA bundle that works regardless of what the OS exposes, so it
+# is used here whenever it's installed. If certifi isn't installed, this
+# falls back to Python's normal default context (works fine in a packaged
+# APK build, where python-for-android bundles its own CA store).
+def _rohi_ssl_context():
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        try:
+            return ssl.create_default_context()
+        except Exception:
+            logger.exception("Could not build any SSL context; HTTPS requests may fail.")
+            return None
+
+
+ROHI_SSL_CONTEXT = _rohi_ssl_context()
+
+# -------------------------------------------------------------
+# Attendance reminder schedule (Monday-Thursday only; Friday is WFH
+# and Saturday/Sunday are non-working days - see
+# ROHIApp._is_attendance_working_day).
+# -------------------------------------------------------------
+REMINDER_CHECKIN_HOUR, REMINDER_CHECKIN_MINUTE = 7, 50
+REMINDER_CHECKOUT_HOUR, REMINDER_CHECKOUT_MINUTE = 15, 50
+# Check-in nudges fire at exact clock times: 07:50 (first), 07:55 (second),
+# 07:59 (third/last) - expressed as minutes after REMINDER_CHECKIN_MINUTE.
+CHECKIN_REMINDER_OFFSETS_MINUTES = [0, 5, 9]
+REMINDER_REPEAT_MINUTES = 5     # gap between check-out nudges
+REMINDER_REPEAT_COUNT = 3       # extra check-out nudges fired after the on-time one
+CHECKOUT_REMINDER_OFFSETS_MINUTES = [
+    slot * REMINDER_REPEAT_MINUTES for slot in range(0, REMINDER_REPEAT_COUNT + 1)
+]
+
+# Single source of truth for the app version shown in Settings. Keep this in
+# sync with the `version =` line in buildozer.spec every time you release an
+# update, so what's displayed on-screen always matches the installed build.
+APP_VERSION = "2.2"
+
+# Dashboard quick links supplied by ROHI. Empty URLs intentionally show a
+# "link will be provided shortly" message until production links are supplied.
+ROHI_EXTERNAL_LINKS = {
+    "website": "https://www.restorationofhopeinitiative.org/",
+    "meet": "https://meet.google.com/hdu-sucm-vnt",
+    "facebook": "https://www.facebook.com/share/1b3hr7daFQ/",
+    "linkedin": "https://www.linkedin.com/company/restoration-of-hope-initiative-rohi/",
+    "tiktok": "https://www.tiktok.com/@rohinigeria?_r=1&_t=ZS-99HAs18jAIC",
+    "whatsapp": "",
+    "instagram": "",
+    "twitter": "",
+    "powerbi": "",
+    "dhis2": "",
+}
+
+
+# How often (seconds) the background auto-sync timer pushes pending rows to
+# the PostgreSQL server without the user pressing "Synchronize Now".
+AUTO_SYNC_INTERVAL_SECONDS = 180
+# Automatic staff session timeout: log out after 15 minutes without activity.
+STAFF_IDLE_TIMEOUT_SECONDS = 15 * 60
+# Report/file synchronization schedules. PostgreSQL/Google-Form sync can run
+# frequently, while the Excel mirror jobs follow the requested ROHI schedule.
+STAFF_EXCEL_SYNC_INTERVAL_SECONDS = 180  # all Excel auto-sync jobs every 3 minutes
+ATTENDANCE_EXCEL_SYNC_INTERVAL_SECONDS = 180  # attendance Excel auto-sync every 3 minutes
+TIMESHEET_EXCEL_SYNC_INTERVAL_SECONDS = 180  # timesheet Excel auto-sync every 3 minutes
+LEAVE_EXCEL_SYNC_INTERVAL_SECONDS = 180  # leave Excel auto-sync every 3 minutes
+EXCEL_SYNC_CONFIG_PATH = os.path.join(APP_DIR, "excel_sync_config.json")
+EXCEL_SYNC_DEFAULTS = {
+    "attendance_link": "https://docs.google.com/spreadsheets/d/e/2PACX-1vRt9XLMR2O9eW2ZMCNvhgxa2iSw8wZTIQZdh4mPNjj7D20YhiuAJSWgOTL3bpBm0g/pubhtml?gid=1377847618&single=true",
+    "timesheet_link": "https://drive.google.com/drive/folders/1GTYacKygoa9O9vH_Oo--ZVZtCijKrEfD?usp=sharing",
+    "leave_link": "https://drive.google.com/drive/folders/1H2EPqb3mPXB2Dty5o7bsg7gopO8cXOSH?usp=sharing",
+    "staff_link": "https://docs.google.com/spreadsheets/d/e/2PACX-1vRaprW63u3MXCbO5RJ0v7xXKkmNp8rVt8JSpPtZupBUAHq38e41c6_laoLjyEfItA/pubhtml?gid=2005932240&single=true",
+    "cfm_link": "",
+    "dwpt_link": "https://drive.google.com/drive/folders/1TwhbzPJ3WpNeJ2BErRVxvI8x_TaqyyBJ?usp=drive_link",
+    "monthly_report_link": "https://drive.google.com/drive/folders/1w5oyuK9tW5uRipO3PMV1a7GH4Doo2t5_?usp=drive_link",
+    # A Google Drive folder URL is a browse/share link, not an upload API.
+    # Put a server/Apps Script upload endpoint in these optional fields to
+    # enable real automatic file transfer.
+    "attendance_endpoint": "https://script.google.com/macros/s/AKfycbwLdMEyiB7nuAT_BHPP5W-eo1VJMgOz_UrpgFjiz5Fo3HDRo8C1KRFrgCmRCkzJNJb6/exec",
+    "timesheet_endpoint": "https://script.google.com/macros/s/AKfycbwLdMEyiB7nuAT_BHPP5W-eo1VJMgOz_UrpgFjiz5Fo3HDRo8C1KRFrgCmRCkzJNJb6/exec",
+    "leave_endpoint": "https://script.google.com/macros/s/AKfycbwLdMEyiB7nuAT_BHPP5W-eo1VJMgOz_UrpgFjiz5Fo3HDRo8C1KRFrgCmRCkzJNJb6/exec",
+    "staff_endpoint": "https://script.google.com/macros/s/AKfycbwLdMEyiB7nuAT_BHPP5W-eo1VJMgOz_UrpgFjiz5Fo3HDRo8C1KRFrgCmRCkzJNJb6/exec",
+    "cfm_endpoint": "https://script.google.com/macros/s/AKfycbwLdMEyiB7nuAT_BHPP5W-eo1VJMgOz_UrpgFjiz5Fo3HDRo8C1KRFrgCmRCkzJNJb6/exec",
+    "dwpt_endpoint": "https://script.google.com/macros/s/AKfycbwLdMEyiB7nuAT_BHPP5W-eo1VJMgOz_UrpgFjiz5Fo3HDRo8C1KRFrgCmRCkzJNJb6/exec",
+    "monthly_report_endpoint": "https://script.google.com/macros/s/AKfycbwLdMEyiB7nuAT_BHPP5W-eo1VJMgOz_UrpgFjiz5Fo3HDRo8C1KRFrgCmRCkzJNJb6/exec",
+    "cfm_status_sync_seconds": 60,
+    "last_staff_sync": "",
+    "last_attendance_sync": "",
+    "last_timesheet_sync": "",
+    "last_leave_sync": "",
+    "last_dwpt_sync": "",
+    "last_monthly_report_sync": "",
+    "link_status": {"attendance": False, "timesheet": False, "leave": False, "staff": False, "cfm": False, "dwpt": False, "monthly_report": False},
+}
+
+# -------------------------------------------------------------
+# DHIS2 integration configuration.
+# All UIDs (program, program stage, org unit, data elements, etc.) must be
+# created inside the target DHIS2 instance first, then pasted into the
+# DHIS2 Connection screen. Left blank by default - the demo instance
+# (https://play.dhis2.org/<version>) does not ship a ROHI-specific
+# program, so this needs a one-time Maintenance-app setup before use.
+DHIS2_SYNC_CONFIG_PATH = os.path.join(APP_DIR, "dhis2_sync_config.json")
+DHIS2_SYNC_DEFAULTS = {
+    "server_url": "",           # e.g. https://play.dhis2.org/40.0.0
+    "username": "",
+    "password": "",
+    "api_token": "",            # optional - takes priority over username/password
+    "org_unit": "",             # DHIS2 org unit UID for this ROHI facility/office
+    # Tracker (individual attendance records)
+    "tracked_entity_type": "",  # e.g. the "Person" tracked entity type UID
+    "program": "",              # ROHI Staff Attendance tracker program UID
+    "program_stage": "",        # attendance event program stage UID
+    "tea_staff_id": "",         # tracked entity attribute UID: Staff ID
+    "tea_full_name": "",        # tracked entity attribute UID: Full Name
+    "de_check_in": "",          # data element UID: Check-in time
+    "de_check_out": "",         # data element UID: Check-out time
+    "de_late": "",              # data element UID: Late (Yes/No)
+    "de_gps_status": "",        # data element UID: GPS/geofence status
+    # Aggregate (present/absent totals)
+    "agg_data_set": "",         # aggregate Data Set UID
+    "agg_de_present": "",       # data element UID: Present count
+    "agg_de_absent": "",        # data element UID: Absent count
+    "agg_de_late": "",          # data element UID: Late count (optional)
+    "last_status": "",
+    "connected": False,
+}
+
+
+def _load_dhis2_config():
+    data = dict(DHIS2_SYNC_DEFAULTS)
+    try:
+        if os.path.exists(DHIS2_SYNC_CONFIG_PATH):
+            with open(DHIS2_SYNC_CONFIG_PATH, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            if isinstance(saved, dict):
+                data.update(saved)
+    except Exception:
+        logger.exception("Could not load DHIS2 sync configuration.")
+    return data
+
+
+def _save_dhis2_config(data):
+    try:
+        with open(DHIS2_SYNC_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        return True
+    except Exception:
+        logger.exception("Could not save DHIS2 sync configuration.")
+        return False
+
+
+# Local map of {staff email: DHIS2 Tracked Entity Instance UID}. Kept as its
+# own small file (rather than a database column) so linking a staff member
+# to DHIS2 doesn't require a schema migration.
+DHIS2_TEI_MAP_PATH = os.path.join(APP_DIR, "dhis2_tei_map.json")
+
+
+def _load_dhis2_tei_map():
+    try:
+        if os.path.exists(DHIS2_TEI_MAP_PATH):
+            with open(DHIS2_TEI_MAP_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        logger.exception("Could not load DHIS2 tracked-entity map.")
+    return {}
+
+
+def _save_dhis2_tei_map(data):
+    try:
+        with open(DHIS2_TEI_MAP_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        return True
+    except Exception:
+        logger.exception("Could not save DHIS2 tracked-entity map.")
+        return False
+
+# -------------------------------------------------------------
+# Public holidays used to label the timesheet grid as "PUBLIC HOLIDAY"
+# instead of a normal work day. Add entries as "YYYY-MM-DD": "Name".
+# Left empty by default - fill in ROHI's official holiday calendar for
+# each year so the exported timesheet marks the right dates.
+# -------------------------------------------------------------
+ROHI_PUBLIC_HOLIDAYS = {
+    # "2026-06-12": "Democracy Day",
+}
+
+
+
+def _load_excel_sync_config():
+    data = dict(EXCEL_SYNC_DEFAULTS)
+    try:
+        if os.path.exists(EXCEL_SYNC_CONFIG_PATH):
+            with open(EXCEL_SYNC_CONFIG_PATH, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            if isinstance(saved, dict):
+                data.update(saved)
+    except Exception:
+        logger.exception("Could not load Excel sync configuration.")
+    return data
+
+
+def _save_excel_sync_config(data):
+    try:
+        with open(EXCEL_SYNC_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        return True
+    except Exception:
+        logger.exception("Could not save Excel sync configuration.")
+        return False
+
+
+def _http_upload_excel(filepath, endpoint, report_type, state_office=""):
+    """Upload an XLSX file to a configured server/Apps-Script endpoint.
+
+    The endpoint receives a multipart/form-data POST with fields:
+    report_type, filename and file. Folder/share URLs are deliberately not
+    treated as upload endpoints because Google Drive folder links do not accept
+    anonymous file uploads.
+    """
+    if not endpoint:
+        return False, "No upload endpoint configured."
+    if not os.path.exists(filepath):
+        return False, "Export file does not exist."
+    try:
+        filename = os.path.basename(filepath)
+        # Google Apps Script Web Apps receive a JSON body reliably from Android.
+        # Use this mode automatically for script.google.com endpoints; normal
+        # HTTP upload endpoints continue to use multipart/form-data below.
+        if "script.google.com" in endpoint.lower():
+            import base64
+            with open(filepath, "rb") as f:
+                payload = base64.b64encode(f.read()).decode("ascii")
+            body = json.dumps({
+                "report_type": report_type,
+                "filename": filename,
+                "state_office": state_office or "",
+                "file_base64": payload,
+            }).encode("utf-8")
+            req = Request(endpoint, data=body, method="POST")
+            req.add_header("Content-Type", "application/json")
+            req.add_header("User-Agent", "ROHI-Attendance-App/1.8")
+            with urlopen(req, timeout=60, context=ROHI_SSL_CONTEXT) as response:
+                status = getattr(response, "status", 200)
+                response.read(2048)
+            if status < 200 or status >= 300:
+                return False, f"Upload endpoint returned HTTP {status}."
+            return True, "Uploaded to Google Drive successfully."
+
+        boundary = "----ROHIExcelSyncBoundary" + str(int(time.time() * 1000))
+        with open(filepath, "rb") as f:
+            payload = f.read()
+
+        def part(name, value):
+            return (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+                f"{value}\r\n"
+            ).encode("utf-8")
+
+        body = bytearray()
+        body.extend(part("report_type", report_type))
+        body.extend(part("filename", filename))
+        body.extend(part("state_office", state_office or ""))
+        body.extend(
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+            f"Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\r\n\r\n"
+            .encode("utf-8")
+        )
+        body.extend(payload)
+        body.extend(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+
+        req = Request(endpoint, data=bytes(body), method="POST")
+        req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+        req.add_header("User-Agent", "ROHI-Attendance-App/1.0")
+        with urlopen(req, timeout=30, context=ROHI_SSL_CONTEXT) as response:
+            status = getattr(response, "status", 200)
+            response.read(1024)
+        if status < 200 or status >= 300:
+            return False, f"Upload endpoint returned HTTP {status}."
+        return True, "Uploaded successfully."
+    except HTTPError as exc:
+        return False, f"Upload failed (HTTP {exc.code})."
+    except URLError:
+        return False, "Upload failed: no network connection."
+    except Exception as exc:
+        logger.exception("Excel upload failed:")
+        return False, f"Upload failed: {exc}"
+
+
+def month_name_to_number(month_name):
+    try:
+        return list(calendar.month_name).index(str(month_name).strip())
+    except ValueError:
+        return datetime.now().month
+
+def _safe_filename(value):
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "file")).strip("_") or "file"
+
+def handle_unhandled_exception(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    logger.critical("Unhandled exception captured:", exc_info=(exc_type, exc_value, exc_traceback))
+
+sys.excepthook = handle_unhandled_exception
+# -------------------------------------------------------------
+
+from kivy.clock import Clock, mainthread
+from kivy.lang import Builder
+from kivy.utils import platform
+from kivy.metrics import dp
+from kivy.core.window import Window
+from kivy.properties import NumericProperty, StringProperty, BooleanProperty
+from kivy.uix.image import Image
+from kivy.uix.behaviors import ButtonBehavior
+
+# Makes Kivy pan the screen so the focused text field stays visible above the
+# on-screen keyboard, instead of the keyboard covering it (was hiding the
+# password field during registration/login on most Android phones).
+Window.softinput_mode = "below_target"
+
+from kivymd.app import MDApp
+from kivymd.uix.screen import MDScreen
+from kivymd.uix.screenmanager import MDScreenManager
+from kivymd.uix.boxlayout import MDBoxLayout
+from kivymd.uix.label import MDLabel
+from kivymd.uix.pickers import MDDatePicker
+from kivymd.uix.menu import MDDropdownMenu
+from kivymd.uix.dialog import MDDialog
+from kivymd.uix.button import MDFlatButton
+from kivymd.uix.textfield import MDTextField
+from plyer import camera, gps
+
+# Import RegistrationScreen from screens module
+from registration_screen import RegistrationScreen
+from reports_screen import ReportsScreen
+from timesheet_screen import TimesheetScreen
+from leave_screen import LeaveScreen
+from cfm_screen import CFMScreen
+from settings_screen import SettingsScreen
+from server_connection_screen import ServerConnectionScreen
+from dwpt_screen import DWPTScreen
+from monthly_report_screen import MonthlyReportScreen
+
+import pg_sync
+import gform_sync
+import openpyxl
+import dhis2_sync
+
+# Local database handlers
+try:
+    from database import (create_table, insert_staff, update_staff, get_staff_by_id, verify_login,
+                           email_exists, staff_number_exists, create_leave_request,
+                           get_leave_requests, get_leave_usage, get_leave_status_counts,
+                           create_cfm_case, get_cfm_counts, get_cfm_cases, update_cfm_case_status, update_cfm_case_details, sync_cfm_remote_status,
+                           get_pending_gform_attendance, mark_gform_synced,
+                           get_staff_count, clear_all_staff)
+except ImportError:
+    logger.warning("Local database module not found; creating inline fallback table handler.")
+    
+    def create_table():
+        db_path = os.path.join(os.path.dirname(__file__), "attendance.db")
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS staff (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fullname TEXT, sex TEXT, dob TEXT, blood_group TEXT, marital_status TEXT,
+                nationality TEXT, state_origin TEXT, lga TEXT, address TEXT, next_of_kin TEXT,
+                next_of_kin_phone TEXT, employment_type TEXT, state_office TEXT, cluster TEXT,
+                department TEXT, section TEXT, position TEXT, staff_number TEXT, phone TEXT,
+                email TEXT, facebook TEXT, twitter TEXT, instagram TEXT, telegram TEXT,
+                linkedin TEXT, gps_coordinate TEXT, photo TEXT, password TEXT
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS attendance (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT,
+                check_in_time TEXT,
+                check_out_time TEXT,
+                late_duration TEXT,
+                attendance_status TEXT,
+                gps_location TEXT,
+                check_out_gps_location TEXT,
+                current_state_office TEXT
+            )
+        ''')
+        # Migration for databases created before check_out_gps_location existed.
+        for col in ("check_out_gps_location", "current_state_office"):
+            try:
+                cursor.execute(f"ALTER TABLE attendance ADD COLUMN {col} TEXT")
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass  # Column already exists.
+        conn.commit()
+        conn.close()
+
+    def get_leave_status_counts(staff_email):
+        return {"Pending": 0, "Approved": 0, "Rejected": 0}
+
+    def get_pending_gform_attendance(limit=50):
+        return []
+
+    def mark_gform_synced(attendance_id):
+        pass
+
+    def insert_staff(data):
+        db_path = os.path.join(os.path.dirname(__file__), "attendance.db")
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO staff (
+                fullname, sex, dob, blood_group, marital_status, nationality, state_origin,
+                lga, address, next_of_kin, next_of_kin_phone, employment_type, state_office,
+                cluster, department, section, position, staff_number, phone, email,
+                facebook, twitter, instagram, telegram, linkedin, gps_coordinate, photo, password
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ''', (
+            data.get("fullname"), data.get("sex"), data.get("dob"), data.get("blood_group"), data.get("marital_status"),
+            data.get("nationality"), data.get("state_origin"), data.get("lga"), data.get("address"), data.get("next_of_kin"),
+            data.get("next_of_kin_phone"), data.get("employment_type"), data.get("state_office"), data.get("cluster"),
+            data.get("department"), data.get("section"), data.get("position"), data.get("staff_number"), data.get("phone"),
+            data.get("email"), data.get("facebook"), data.get("twitter"), data.get("instagram"), data.get("telegram"),
+            data.get("linkedin"), data.get("gps_coordinate"), data.get("photo"), data.get("password")
+        ))
+        conn.commit()
+        conn.close()
+
+    def verify_login(email_or_staff, password):
+        db_path = os.path.join(os.path.dirname(__file__), "attendance.db")
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        identifier = (email_or_staff or "").strip().lower()
+        cursor.execute('''
+            SELECT * FROM staff WHERE (LOWER(TRIM(email))=? OR LOWER(TRIM(staff_number))=?) AND password=?
+        ''', (identifier, identifier, password))
+        user = cursor.fetchone()
+        conn.close()
+        return user
+
+    def get_staff_count():
+        db_path = os.path.join(os.path.dirname(__file__), "attendance.db")
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM staff")
+        count = cursor.fetchone()[0]
+        conn.close()
+        return int(count or 0)
+
+    def clear_all_staff():
+        db_path = os.path.join(os.path.dirname(__file__), "attendance.db")
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM staff")
+        conn.commit()
+        conn.close()
+
+
+# Fixed office coordinates used for geofencing. Instead of relying on the GPS
+# captured on a staff member's device at registration time (which could be
+# inaccurate or spoofed), the registration form's GPS Coordinate field is
+# auto-filled - and stays static - from whichever State Office is selected.
+STATE_OFFICES = [
+    "Borno State Office",
+    "Adamawa HQ",
+    "Yobe State Office",
+    "Taraba State Office",
+    "Benue State Office",
+]
+
+OFFICES = {
+    "Borno State Office": {"latitude": 11.798630, "longitude": 13.145316, "radius": 30},
+    "Adamawa HQ": {"latitude": 9.2781640, "longitude": 12.432640, "radius": 30},
+    "Yobe State Office": {"latitude": 11.7460, "longitude": 11.9660, "radius": 30},
+    "Taraba State Office": {"latitude": 8.8936, "longitude": 11.3595, "radius": 30},
+    "Benue State Office": {"latitude": 7.7322, "longitude": 8.5391, "radius": 30},
+    # Retained for legacy data only; not offered as an active registration office.
+    "Sokoto State Office": {"latitude": 13.0622, "longitude": 5.2339, "radius": 30},
+}
+
+# Compulsory registration fields (marked with * on the form), paired with
+# the human-readable label shown in the "missing field" error dialog.
+REQUIRED_REGISTRATION_FIELDS = [
+    ("fullname", "Name"),
+    ("sex", "Sex"),
+    ("dob", "Date of Birth"),
+    ("marital_status", "Marital Status"),
+    ("nationality", "Nationality"),
+    ("state_origin", "State of Origin"),
+    ("lga", "LGA"),
+    ("address", "Residential Address"),
+    ("next_of_kin", "Next of Kin"),
+    ("next_of_kin_phone", "Next of Kin Phone"),
+    ("state_office", "State"),
+    ("department", "Department"),
+    ("section", "Section"),
+    ("position", "Position"),
+    ("employment_type", "Employment Type"),
+    ("email", "Office Email"),
+    ("phone", "Phone No"),
+    ("staff_number", "Staff ID No"),
+]
+
+
+class TikTokButton(ButtonBehavior, Image):
+    """Image-based TikTok button so the dashboard uses the real logo asset
+    instead of a generic music-note Material Design icon.  ButtonBehavior
+    keeps the control lightweight and compatible with KivyMD 1.2.0."""
+    pass
+
+
+class SplashScreen(MDScreen):
+    pass
+
+class LoginScreen(MDScreen):
+    pass
+
+class DashboardScreen(MDScreen):
+    pass
+
+
+class ROHIAttendanceApp(MDApp):
+    # Shown in Settings. Update APP_VERSION above (and
+    # buildozer.spec's `version =` line) together on every release.
+    app_version = StringProperty(APP_VERSION)
+    google_links_unlocked = BooleanProperty(False)
+
+    # Exposes the module-level ROHI_EXTERNAL_LINKS dict as app.ROHI_EXTERNAL_LINKS
+    # so .kv on_release callbacks can reach it reliably. KV rule callbacks are
+    # not guaranteed to see plain module globals, but every KV file already
+    # has access to the running App instance as `app` - going through that is
+    # the same pattern used by every other callback in this codebase (e.g.
+    # app.open_external_link, app.open_dashboard).
+    ROHI_EXTERNAL_LINKS = ROHI_EXTERNAL_LINKS
+
+    # Safe-area insets (in dp) for the status bar / display cutout and the
+    # bottom gesture-navigation bar. These differ a lot between phones (a
+    # Redmi/MIUI phone with a punch-hole camera + gesture nav bar reserves
+    # very different space than the device this UI was first tested on).
+    # Kivy/KivyMD render into the full window canvas and don't account for
+    # these system bars automatically, so without this, header content can
+    # render underneath the status bar/notch and the bottom action buttons
+    # can render underneath the gesture bar - which looks like the layout
+    # is "scattered"/overlapping even though the .kv itself is correct.
+    safe_area_top = NumericProperty(0)
+    safe_area_bottom = NumericProperty(0)
+
+    def _refresh_window_layout(self, *args):
+        """Keep the UI responsive when Android changes the usable window size.
+
+        Rotation, split-screen, foldables and large tablets can change the
+        window dimensions after startup. The KV layout uses root.width for
+        the dashboard content width, so forcing a fixed resolution is avoided.
+        """
+        try:
+            logger.debug("Window layout changed: %.0fx%.0f px", Window.width, Window.height)
+        except Exception:
+            pass
+
+    def _apply_android_safe_area_insets(self):
+        """Read the real status-bar/notch and gesture-nav-bar heights from
+        Android and store them (in dp) so .kv files can pad around them."""
+        if platform != "android":
+            return
+        try:
+            from jnius import autoclass
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            activity = PythonActivity.mActivity
+            decor_view = activity.getWindow().getDecorView()
+            root_insets = decor_view.getRootWindowInsets()
+            density = float(activity.getResources().getDisplayMetrics().density)
+
+            top_px = 0
+            bottom_px = 0
+            if root_insets is not None:
+                try:
+                    WindowInsetsType = autoclass("android.view.WindowInsets$Type")
+                    mask = WindowInsetsType.systemBars()
+                    insets = root_insets.getInsets(mask)
+                    top_px = int(insets.top)
+                    bottom_px = int(insets.bottom)
+                except Exception:
+                    # Older Android APIs (< 30) don't have WindowInsets.Type;
+                    # fall back to the deprecated stable-inset getters.
+                    top_px = int(root_insets.getStableInsetTop())
+                    bottom_px = int(root_insets.getStableInsetBottom())
+
+            if density > 0:
+                self.safe_area_top = top_px / density
+                self.safe_area_bottom = bottom_px / density
+            logger.info(
+                "Android safe-area insets applied: top=%.1fdp bottom=%.1fdp",
+                self.safe_area_top, self.safe_area_bottom
+            )
+        except Exception:
+            logger.exception("Could not read Android safe-area insets; using 0.")
+
+    def build(self):
+        self.title = "ROHI Staff App"
+        self.theme_cls.primary_palette = "Green"
+        
+        logger.info("Initializing database table...")
+        try:
+            create_table()
+            logger.info("Database initialized successfully.")
+        except Exception:
+            logger.exception("Error during database creation:")
+        
+        self.photo_path = ""
+        self.signature_path = ""
+        self.static_gps = "11.806576° N, 13.117692° E"
+        # Never use the static office coordinate as a substitute for a live
+        # phone GPS fix during Check-In/Check-Out.
+        self.current_location = ""
+        self._checkin_gps_fix = None
+        self._checkout_gps_fix = None
+        self._android_location_listener = None
+        self._gps_poll_stop = None
+        self._checkout_gps_poll_stop = None
+        self._gps_timeout_event = None
+        self.active_menu = None
+        self.checked_in = False
+        self.check_in_datetime = None
+        self.check_out_datetime = None
+        self.current_user = None
+        self._session_restore_in_progress = False
+        self._last_user_activity_monotonic = time.monotonic()
+        self._backgrounded_at_monotonic = None
+        self._idle_logout_notice = False
+        self._excel_sync_lock = threading.Lock()
+        self._excel_sync_state = _load_excel_sync_config()
+        self._dhis2_sync_lock = threading.Lock()
+        self._dhis2_state = _load_dhis2_config()
+        self._last_attendance_excel_sync_date = ""
+        self._last_staff_excel_sync_at = ""
+        self._last_timesheet_excel_sync_at = ""
+        self._last_leave_excel_sync_at = ""
+        self._excel_leave_schedule_running = False
+        self._excel_staff_schedule_running = False
+        self._excel_attendance_schedule_running = False
+        self._excel_timesheet_schedule_running = False
+        self.late_duration_str = "On Time"
+        self._checkin_pending = False
+        self._checkout_pending = False
+        # registered base GPS coordinate for Check-In to be accepted.
+        # Editable from Settings > GPS/Geofencing; kept as an app-level attribute
+        # (not hardcoded in _check_geofence) so a saved change takes effect immediately.
+        # Persisted in app_settings.json (separate from server_config.json) so it
+        # survives restarts but is untouched by Reset Database / server config changes.
+        self.GEOFENCE_RADIUS_METERS = self._load_geofence_radius()
+        # All ROHI offices use a strict 30 m geofence. This is deliberately
+        # not changed by stale per-device settings.
+        self.GEOFENCE_RADIUS_METERS = 30
+
+        # Load KV Files safely. Each file is loaded in its own try/except -
+        # previously all 12 files were loaded inside a single try/except
+        # around the whole loop, so a parse failure in ANY one file (e.g. a
+        # bad .kv syntax) silently aborted the loop and left every file
+        # *after* it in this list completely unloaded - not just broken, but
+        # with zero styling/ids at all (their MDScreens render with default
+        # white backgrounds, and any code doing ids.some_widget on them
+        # crashes with an AttributeError, since ids is simply empty).
+        kv_files = ["splash.kv", "login.kv", "registration.kv", "dashboard.kv",
+                    "reports.kv", "timesheet.kv", "leave.kv", "cfm.kv", "dwpt.kv", "monthly_report.kv", "settings.kv", "server_connection.kv"]
+        failed_kv_files = []
+        for kv_name in kv_files:
+            kv_file = os.path.join(APP_DIR, kv_name)
+            try:
+                if os.path.exists(kv_file):
+                    Builder.load_file(kv_file)
+                else:
+                    raise FileNotFoundError(f"Missing KV file: {kv_file}")
+            except Exception:
+                failed_kv_files.append(kv_name)
+                logger.exception(f"Failed to load KV file '{kv_name}' - continuing with the rest:")
+        if failed_kv_files:
+            logger.error(f"KV layout files that failed to load: {failed_kv_files}. Affected screens will be unstyled/broken.")
+        else:
+            logger.info("KV layout files loaded successfully.")
+
+        sm = MDScreenManager()
+        # No-Transition instead of the default Slide/Fade transition.
+        # Kivy's animated transitions render both the outgoing and incoming
+        # screens into offscreen textures (FBOs) and composite them while
+        # sliding. On some budget GPUs (seen on the Redmi 14C) that FBO
+        # composite step glitches: the previous screen's content stays
+        # visible underneath the new one, and text can render corrupted
+        # (wrapped one character per line) mid-transition. Switching to an
+        # instant, non-animated transition skips that FBO step entirely,
+        # which removes this whole class of rendering glitch on any phone.
+        from kivy.uix.screenmanager import NoTransition
+        sm.transition = NoTransition()
+        sm.add_widget(SplashScreen(name="splash"))
+        sm.add_widget(LoginScreen(name="login"))
+        sm.add_widget(RegistrationScreen(name="registration"))
+        sm.add_widget(DashboardScreen(name="dashboard"))
+        sm.add_widget(ReportsScreen(name="reports"))
+        sm.add_widget(TimesheetScreen(name="timesheet"))
+        sm.add_widget(LeaveScreen(name="leave"))
+        sm.add_widget(CFMScreen(name="cfm"))
+        sm.add_widget(DWPTScreen(name="dwpt"))
+        sm.add_widget(MonthlyReportScreen(name="monthly_report"))
+        sm.add_widget(SettingsScreen(name="settings"))
+        sm.add_widget(ServerConnectionScreen(name="server_connection"))
+
+        self.registration_screen = sm.get_screen("registration")
+        self.dashboard_screen = sm.get_screen("dashboard")
+        self.reports_screen = sm.get_screen("reports")
+        self.timesheet_screen = sm.get_screen("timesheet")
+        self.leave_screen = sm.get_screen("leave")
+        self.cfm_screen = sm.get_screen("cfm")
+        self.dwpt_screen = sm.get_screen("dwpt")
+        self.monthly_report_screen = sm.get_screen("monthly_report")
+        self.settings_screen = sm.get_screen("settings")
+        self.server_connection_screen = sm.get_screen("server_connection")
+
+        Clock.schedule_once(self._restore_or_open_login, 1.2)
+        # Excel mirror jobs: staff corrections are checked once every 24 hours;
+        # attendance is mirrored at 5:00 PM each day. The check also runs after
+        # app launch so a phone that was offline at 5 PM catches up later.
+        Clock.schedule_once(lambda dt: self._excel_sync_schedule_tick(), 3)
+        Clock.schedule_interval(lambda dt: self._excel_sync_schedule_tick(), 30)
+        # Pull CFM status changes made in the central Google Sheet back to the APK.
+        Clock.schedule_once(lambda dt: self._sync_cfm_statuses_from_google(), 5)
+        Clock.schedule_interval(lambda dt: self._sync_cfm_statuses_from_google(), 60)
+
+        # Run the live dashboard clock app-wide from launch (not tied to login),
+        # so it's never stuck on the "Loading Date & Time..." placeholder.
+        self.update_dashboard_time()
+        Clock.schedule_interval(self.update_dashboard_time, 1)
+        Clock.schedule_interval(self._idle_session_tick, 30)
+
+        # Attendance Check-In/Check-Out reminders (07:50 / 15:50, Mon-Thu only)
+        self._reminder_state = {"date": None, "checkin": set(), "checkout": set()}
+        Clock.schedule_interval(self._reminder_tick, 30)
+
+        # Silent background sync - pushes any pending rows to the server
+        # every AUTO_SYNC_INTERVAL_SECONDS without needing "Synchronize Now".
+        Clock.schedule_interval(self._auto_sync_tick, AUTO_SYNC_INTERVAL_SECONDS)
+        # Restore the persistent DB connection (if a link was already
+        # configured/saved) shortly after launch, instead of only on the
+        # first periodic tick 3 minutes later - otherwise the Dashboard/
+        # Settings "connected" status sits on "NOT CONNECTED" for the first
+        # 3 minutes of every single launch even when a working link is saved.
+        Clock.schedule_once(lambda dt: self._auto_sync_tick(), 4)
+        # Likewise, auto-test the configured Excel report links shortly after
+        # launch so the dashboard's "Excel Sync: x/7 CONNECTED" badge reflects
+        # reality immediately, instead of always starting on "NOT CONNECTED"
+        # until the user manually opens Settings and tests each link.
+        Clock.schedule_once(lambda dt: self._auto_connect_excel_links(), 4)
+
+        return sm
+
+    def _auto_connect_excel_links(self):
+        """Test each configured Excel report link in the background at
+        startup (and update the dashboard badge as each result comes in),
+        without requiring the user to manually visit Settings first."""
+        for report_type in ("attendance", "timesheet", "leave", "staff", "cfm", "dwpt", "monthly_report"):
+            try:
+                url = str(self._excel_sync_state.get(f"{report_type}_link") or "").strip()
+                if url.startswith(("http://", "https://")):
+                    self.connect_excel_report(report_type)
+            except Exception:
+                logger.exception(f"Auto-connect failed for {report_type} Excel link:")
+
+    def on_start(self):
+        """Dropdown menu fields are opened via on_focus handlers declared directly
+        in kv/registration.kv. (Previously this also bound duplicate on_touch_down
+        handlers here, which could double-trigger a menu open on a single tap and
+        occasionally left the wrong field focused/populated - removed for that reason.)"""
+        self._start_background_reminder_service()
+        # Small delay so the Android window/decor view is fully attached
+        # before we query its inset values (asking immediately on some
+        # devices/ROMs returns 0 because the window hasn't laid out yet).
+        Clock.schedule_once(lambda dt: self._apply_android_safe_area_insets(), 0.3)
+        # Recalculate/re-layout naturally when Android changes the available
+        # window (tablets, split-screen, foldables, or device configuration).
+        Window.bind(size=self._refresh_window_layout)
+        Window.bind(on_touch_down=self._mark_user_activity)
+        Window.bind(on_key_down=self._mark_user_activity)
+
+    def _start_background_reminder_service(self):
+        """Starts the ServiceReminder Android service (service_reminder.py) so
+        the 07:50/07:55/07:59 (and 15:50-series) reminders still fire even
+        while the app is closed or the screen is off - the in-app Clock-based
+        _reminder_tick only runs while this app is actually in the foreground.
+        No-op (silently) on desktop or if anything about the service API is
+        unavailable, so it can never crash app startup."""
+        if platform != "android":
+            return
+        try:
+            from jnius import autoclass
+            package_name = "org.rohi.rohiattendance"  # buildozer.spec: package.domain + package.name
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            ServiceReminder = autoclass("{}.ServiceReminder".format(package_name))
+            ServiceReminder.start(PythonActivity.mActivity, "")
+            self._reminder_service = ServiceReminder
+            logger.info("Background reminder service started.")
+        except Exception:
+            logger.exception("Could not start background reminder service; falling back to in-app reminders only.")
+
+    def _dismiss_active_menu(self):
+        if self.active_menu:
+            self.active_menu.dismiss()
+            self.active_menu = None
+
+    # -----------------------------
+    # Local App Settings (app_settings.json) - geofence radius, etc.
+    # -----------------------------
+    def _app_settings_path(self):
+        return os.path.join(os.path.dirname(__file__), "app_settings.json")
+
+    def _load_reminders_enabled(self):
+        try:
+            path = self._app_settings_path()
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return bool(data.get("reminders_enabled", True))
+        except Exception:
+            logger.exception("Failed to load app_settings.json; defaulting reminders to ON.")
+        return True
+
+    def _save_reminders_enabled(self, enabled):
+        try:
+            path = self._app_settings_path()
+            data = {}
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            data["reminders_enabled"] = bool(enabled)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            logger.exception("Failed to save reminder notification preference:")
+
+    def toggle_reminder_notifications(self, enabled):
+        """Bound to the Attendance Reminder Notifications switch in Settings.
+        Also read by service_reminder.py (the background service) so turning
+        this off silences both the in-app and background reminders."""
+        self._save_reminders_enabled(enabled)
+
+    def open_notification_settings(self):
+        """Bound to 'Open Notification Settings' in Settings - jumps straight
+        to this app's Android system notification settings page, so the user
+        can control sound/vibration/banner style at the OS level."""
+        if platform != "android":
+            return
+        try:
+            from jnius import autoclass
+            Intent = autoclass("android.content.Intent")
+            Settings = autoclass("android.provider.Settings")
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            activity = PythonActivity.mActivity
+            intent = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+            intent.putExtra(Settings.EXTRA_APP_PACKAGE, activity.getPackageName())
+            activity.startActivity(intent)
+        except Exception:
+            logger.exception("Could not open Android notification settings:")
+
+    def _load_geofence_radius(self):
+        try:
+            path = self._app_settings_path()
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return int(data.get("geofence_radius_meters", 30))
+        except Exception:
+            logger.exception("Failed to load app_settings.json; using default geofence radius.")
+        return 50
+
+    def _load_google_form_url(self):
+        try:
+            path = self._app_settings_path()
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return str(data.get("google_form_url", ""))
+        except Exception:
+            logger.exception("Failed to load app_settings.json; using empty Google Form URL.")
+        return ""
+
+    def _save_google_form_url(self, url):
+        try:
+            path = self._app_settings_path()
+            data = {}
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            data["google_form_url"] = url
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            logger.exception("Failed to save Google Form URL to app_settings.json:")
+
+    def open_google_form(self):
+        """Opens the staff-configured Google Form link in the phone's browser."""
+        ids = self.server_connection_screen.ids
+        url = ids.google_form_url_field.text.strip() if hasattr(ids, 'google_form_url_field') else ""
+        if not url:
+            self._set_sync_result_label("Enter a Google Form URL first.", ok=False)
+            return
+        if not (url.startswith("http://") or url.startswith("https://")):
+            url = "https://" + url
+        self._save_google_form_url(url)
+        if platform != 'android':
+            self._set_sync_result_label("Opening a browser is only available on an Android device.", ok=False)
+            return
+        try:
+            from jnius import autoclass
+            Intent = autoclass('android.content.Intent')
+            Uri = autoclass('android.net.Uri')
+            PythonActivity = autoclass('org.kivy.android.PythonActivity')
+            intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+            PythonActivity.mActivity.startActivity(intent)
+        except Exception as e:
+            logger.exception("Could not open Google Form URL:")
+            self._set_sync_result_label(f"Could not open the link: {e}", ok=False)
+
+    def save_google_form_prefilled_url(self):
+        """Reads the pre-filled Google Form link pasted into Settings, parses
+        out its entry IDs by matching the ROHI_* placeholder tokens, and saves
+        the result so the app can silently POST attendance rows straight into
+        the form (see gform_sync.py for the full field-token scheme)."""
+        ids = self.server_connection_screen.ids
+        url = (ids.google_form_prefilled_url_field.text.strip()
+               if hasattr(ids, 'google_form_prefilled_url_field') else "")
+
+        ok, message, entry_map, response_url = gform_sync.parse_prefilled_url(url)
+        status_label = getattr(ids, 'google_form_auto_sync_status_label', None)
+
+        if not ok:
+            if status_label is not None:
+                status_label.text = message
+                status_label.text_color = (0.8, 0.1, 0.1, 1)
+            logger.warning("Google Form auto-detect failed: %s", message)
+            return
+
+        config = {
+            "response_url": response_url,
+            "entry_map": entry_map,
+            "configured_fields": list(entry_map.keys()),
+        }
+        saved, save_message = gform_sync.save_config(config)
+        if status_label is not None:
+            status_label.text = message if saved else save_message
+            status_label.text_color = (0.1, 0.5, 0.15, 1) if saved else (0.8, 0.1, 0.1, 1)
+        logger.info("Google Form auto-sync configured: %s", message)
+
+    def _load_google_form_auto_sync_status(self):
+        """Restores the auto-sync status label when the Server Connection
+        screen is (re)opened, so the admin can see it's still configured
+        without having to paste the link again."""
+        try:
+            ids = self.server_connection_screen.ids
+            status_label = getattr(ids, 'google_form_auto_sync_status_label', None)
+            if status_label is None:
+                return
+            if gform_sync.is_configured():
+                config = gform_sync.load_config()
+                fields = ", ".join(config.get("configured_fields", []))
+                status_label.text = f"Auto-submit is ON ({fields})."
+                status_label.text_color = (0.1, 0.5, 0.15, 1)
+            else:
+                status_label.text = "Auto-submit is OFF - paste a pre-filled link above."
+                status_label.text_color = (0.5, 0.5, 0.5, 1)
+        except Exception:
+            logger.exception("Failed to load Google Form auto-sync status:")
+
+    # -----------------------------
+    # Full Device Backup / Restore
+    # -----------------------------
+    def _backup_status(self, message, ok=True):
+        """Update backup status wherever Backup & Restore is shown."""
+        try:
+            targets = []
+            if hasattr(self, "settings_screen"):
+                targets.append((self.settings_screen, "backup_status_label"))
+            try:
+                server_screen = self.root.get_screen("server_connection")
+                targets.append((server_screen, "server_backup_status_label"))
+            except Exception:
+                pass
+            try:
+                login_screen = self.root.get_screen("login")
+                targets.append((login_screen, "login_backup_status_label"))
+            except Exception:
+                pass
+            for screen, widget_id in targets:
+                try:
+                    label = screen.ids.get(widget_id)
+                    if label is not None:
+                        label.text = message
+                        label.text_color = (0.10, 0.55, 0.18, 1) if ok else (0.75, 0.12, 0.12, 1)
+                except Exception:
+                    continue
+        except Exception:
+            logger.exception("Could not update backup status label.")
+
+    def _backup_files_manifest(self):
+        """Return the files/directories that belong to a portable ROHI backup."""
+        items = []
+        db_path = os.path.join(APP_DIR, "attendance.db")
+        if os.path.exists(db_path):
+            items.append((db_path, "attendance.db"))
+        for filename in BACKUP_CONFIG_FILES:
+            path = os.path.join(APP_DIR, filename)
+            if os.path.exists(path):
+                items.append((path, filename))
+        for dirname in BACKUP_DATA_DIRS:
+            path = os.path.join(APP_DIR, dirname)
+            if os.path.isdir(path):
+                for base, _dirs, files in os.walk(path):
+                    for filename in files:
+                        full = os.path.join(base, filename)
+                        rel = os.path.relpath(full, APP_DIR).replace(os.sep, "/")
+                        items.append((full, rel))
+        return items
+
+    def _normalize_backup_db_paths(self, db_path, source_app_dir=None):
+        """Make persisted photo/signature paths portable across Android installs."""
+        conn = sqlite3.connect(db_path, timeout=15)
+        try:
+            conn.execute("PRAGMA busy_timeout=15000")
+            source_root = os.path.normpath(source_app_dir or APP_DIR)
+            for table, column in (("staff", "photo"), ("leave_requests", "manager_signature")):
+                try:
+                    rows = conn.execute(f"SELECT rowid, {column} FROM {table}").fetchall()
+                except sqlite3.DatabaseError:
+                    continue
+                for rowid, value in rows:
+                    if not value:
+                        continue
+                    text = str(value)
+                    normalized = os.path.normpath(text)
+                    try:
+                        rel = os.path.relpath(normalized, source_root)
+                        if rel != os.pardir and not rel.startswith(os.pardir + os.sep):
+                            rel = rel.replace(os.sep, "/")
+                            conn.execute(f"UPDATE {table} SET {column}=? WHERE rowid=?", (rel, rowid))
+                    except Exception:
+                        continue
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _rewrite_restored_db_paths(self, db_path, old_app_dir):
+        """Turn portable relative media paths back into this phone's APP_DIR paths."""
+        conn = sqlite3.connect(db_path, timeout=15)
+        try:
+            conn.execute("PRAGMA busy_timeout=15000")
+            for table, column in (("staff", "photo"), ("leave_requests", "manager_signature")):
+                try:
+                    rows = conn.execute(f"SELECT rowid, {column} FROM {table}").fetchall()
+                except sqlite3.DatabaseError:
+                    continue
+                for rowid, value in rows:
+                    if not value:
+                        continue
+                    text = str(value)
+                    # Old backups may contain an absolute path from the source phone.
+                    if os.path.isabs(text):
+                        if old_app_dir and os.path.normpath(text).startswith(os.path.normpath(old_app_dir) + os.sep):
+                            text = os.path.relpath(text, old_app_dir)
+                        else:
+                            # Keep an unrelated absolute path only if the file is actually present.
+                            continue
+                    rel = text.replace("/", os.sep)
+                    if rel.startswith("staff_photos" + os.sep) or rel.startswith("staff_signatures" + os.sep):
+                        conn.execute(f"UPDATE {table} SET {column}=? WHERE rowid=?", (os.path.join(APP_DIR, rel), rowid))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def export_full_backup(self):
+        """Create a complete portable ROHI backup in the phone's Downloads folder."""
+        self._dismiss_active_menu()
+        if not os.path.exists(os.path.join(APP_DIR, "attendance.db")):
+            self._backup_status("No local database is available to back up.", ok=False)
+            return
+        temp_dir = os.path.join(self.user_data_dir, "backup_work")
+        os.makedirs(temp_dir, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        work_db = os.path.join(temp_dir, "attendance_snapshot.db")
+        backup_tmp = os.path.join(temp_dir, f"ROHI_Backup_{stamp}.zip.tmp")
+        try:
+            for path in (work_db, backup_tmp):
+                try:
+                    if os.path.exists(path): os.remove(path)
+                except Exception:
+                    pass
+
+            # SQLite's backup API creates a consistent snapshot even when WAL mode is active.
+            src_conn = sqlite3.connect(os.path.join(APP_DIR, "attendance.db"), timeout=15)
+            try:
+                dst_conn = sqlite3.connect(work_db, timeout=15)
+                try:
+                    src_conn.backup(dst_conn)
+                finally:
+                    dst_conn.close()
+            finally:
+                src_conn.close()
+
+            # Normalize media paths inside the snapshot so they survive a new Android app path.
+            self._normalize_backup_db_paths(work_db, APP_DIR)
+
+            manifest = {
+                "backup_version": BACKUP_VERSION,
+                "app_version": APP_VERSION,
+                "created_at": datetime.now().isoformat(),
+                "source_app_dir": APP_DIR,
+                "contains": ["staff", "attendance", "leave_requests", "cfm_cases", "saved_settings", "staff_media"],
+                "session_included": False,
+            }
+            download_dir = self._get_download_dir()
+            os.makedirs(download_dir, exist_ok=True)
+            filename = f"ROHI_FULL_BACKUP_{stamp}.zip"
+            output_path = os.path.join(download_dir, filename)
+
+            with zipfile.ZipFile(backup_tmp, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+                zf.writestr("backup_manifest.json", json.dumps(manifest, indent=2))
+                zf.write(work_db, "attendance.db")
+                for path, arcname in self._backup_files_manifest():
+                    if os.path.normpath(path) == os.path.normpath(os.path.join(APP_DIR, "attendance.db")):
+                        continue
+                    zf.write(path, arcname)
+
+            shutil.copy2(backup_tmp, output_path)
+            self._backup_status(f"Backup exported: {filename}", ok=True)
+            logger.info("Full ROHI backup exported to %s", output_path)
+        except Exception as exc:
+            logger.exception("Full ROHI backup export failed:")
+            self._backup_status(f"Backup export failed: {exc}", ok=False)
+        finally:
+            for path in (work_db, backup_tmp):
+                try:
+                    if os.path.exists(path): os.remove(path)
+                except Exception:
+                    pass
+
+    def import_full_backup(self):
+        """Open the Android file picker and restore a previously exported backup."""
+        self._dismiss_active_menu()
+        try:
+            from plyer import filechooser
+            filechooser.open_file(
+                on_selection=self._on_backup_file_selected,
+                filters=["*.zip"],
+                multiple=False,
+            )
+            self._backup_status("Select a ROHI backup ZIP file.", ok=True)
+        except Exception as exc:
+            logger.exception("Could not open backup file picker:")
+            self._backup_status(f"Could not open backup picker: {exc}", ok=False)
+
+    def _on_backup_file_selected(self, selection):
+        if not selection:
+            self._backup_status("No backup file selected.", ok=False)
+            return
+        source = selection[0] if isinstance(selection, (list, tuple)) else selection
+        if not source:
+            self._backup_status("No backup file selected.", ok=False)
+            return
+        source = str(source)
+        # Some Android file pickers return a content:// URI rather than a
+        # filesystem path. Copy it into the app's temporary restore folder so
+        # the same validation/restoration code works on both forms.
+        if source.startswith("content://"):
+            try:
+                local_dir = os.path.join(self.user_data_dir, "restore_work")
+                os.makedirs(local_dir, exist_ok=True)
+                local_path = os.path.join(local_dir, "selected_rohi_backup.zip")
+                from jnius import autoclass
+                activity = autoclass("org.kivy.android.PythonActivity").mActivity
+                uri_cls = autoclass("android.net.Uri")
+                uri = uri_cls.parse(source)
+                stream = activity.getContentResolver().openInputStream(uri)
+                if stream is None:
+                    raise RuntimeError("Android could not open the selected backup file.")
+                try:
+                    with open(local_path, "wb") as out:
+                        buffer = bytearray(1024 * 1024)
+                        # java.io.InputStream.read(byte[]) is awkward through
+                        # pyjnius; read() one byte-array sized chunk instead.
+                        while True:
+                            data = stream.read(1024 * 1024)
+                            if data == -1:
+                                break
+                            if isinstance(data, int):
+                                # Fallback for runtimes that expose read() as
+                                # a single-byte integer.
+                                out.write(bytes([data]))
+                            else:
+                                out.write(bytes(data))
+                finally:
+                    stream.close()
+                source = local_path
+            except Exception as exc:
+                logger.exception("Could not copy Android content URI backup:")
+                self._backup_status(f"Could not read selected backup: {exc}", ok=False)
+                return
+        self._restore_full_backup(source)
+
+    def _restore_full_backup(self, source_path):
+        """Validate and restore a ROHI backup, then require a fresh login."""
+        self._backup_status("Restoring backup...", ok=True)
+        temp_root = os.path.join(self.user_data_dir, "restore_work")
+        extract_dir = os.path.join(temp_root, "extracted")
+        try:
+            if not os.path.isfile(source_path) or not zipfile.is_zipfile(source_path):
+                raise ValueError("The selected file is not a valid ROHI backup ZIP.")
+            if os.path.exists(temp_root):
+                shutil.rmtree(temp_root, ignore_errors=True)
+            os.makedirs(extract_dir, exist_ok=True)
+
+            with zipfile.ZipFile(source_path, "r") as zf:
+                names = zf.namelist()
+                for name in names:
+                    normalized = os.path.normpath(name)
+                    if normalized.startswith(".." + os.sep) or os.path.isabs(name):
+                        raise ValueError("Backup contains an unsafe file path and was rejected.")
+                if "backup_manifest.json" not in names or "attendance.db" not in names:
+                    raise ValueError("This is not a complete ROHI backup.")
+                manifest = json.loads(zf.read("backup_manifest.json").decode("utf-8"))
+                if str(manifest.get("backup_version") or "") != BACKUP_VERSION:
+                    raise ValueError("Unsupported ROHI backup version.")
+                zf.extractall(extract_dir)
+
+            restored_db = os.path.join(extract_dir, "attendance.db")
+            # Validate the database before replacing the live one.
+            conn = sqlite3.connect(restored_db, timeout=15)
+            try:
+                tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            finally:
+                conn.close()
+            required = {"staff", "attendance", "leave_requests", "cfm_cases"}
+            missing = sorted(required - tables)
+            if missing:
+                raise ValueError("Backup database is missing: " + ", ".join(missing))
+
+            old_app_dir = str(manifest.get("source_app_dir") or "")
+            self._rewrite_restored_db_paths(restored_db, old_app_dir)
+
+            live_db = os.path.join(APP_DIR, "attendance.db")
+            # Remove WAL sidecars so SQLite cannot mix the restored snapshot with old transactions.
+            for sidecar in (live_db + "-wal", live_db + "-shm"):
+                try:
+                    if os.path.exists(sidecar): os.remove(sidecar)
+                except Exception:
+                    pass
+            shutil.copy2(restored_db, live_db)
+
+            # Restore saved settings/configuration files. The login session is intentionally excluded.
+            for filename in BACKUP_CONFIG_FILES:
+                src = os.path.join(extract_dir, filename)
+                dst = os.path.join(APP_DIR, filename)
+                if os.path.exists(src):
+                    shutil.copy2(src, dst)
+
+            for dirname in BACKUP_DATA_DIRS:
+                src_dir = os.path.join(extract_dir, dirname)
+                dst_dir = os.path.join(APP_DIR, dirname)
+                if os.path.isdir(src_dir):
+                    if os.path.isdir(dst_dir):
+                        shutil.rmtree(dst_dir, ignore_errors=True)
+                    shutil.copytree(src_dir, dst_dir)
+
+            # Do not restore the previous phone's authentication session.
+            self._clear_login_session()
+            self.current_user = None
+            self.checked_in = False
+            self.check_in_datetime = None
+            self.check_out_datetime = None
+            create_table()
+            self._excel_sync_state = _load_excel_sync_config()
+            self._dhis2_state = _load_dhis2_config()
+            self._backup_status("Backup restored successfully. Please log in again.", ok=True)
+            self.root.current = "login"
+            logger.info("Full ROHI backup restored successfully from %s", source_path)
+        except Exception as exc:
+            logger.exception("Full ROHI backup restore failed:")
+            self._backup_status(f"Backup restore failed: {exc}", ok=False)
+        finally:
+            shutil.rmtree(temp_root, ignore_errors=True)
+
+    # -----------------------------
+    # Attendance History Reset
+    # -----------------------------
+    def reset_database_tables(self):
+        """Clear attendance history only; NEVER delete staff registrations."""
+        db_path = os.path.join(APP_DIR, "attendance.db")
+        conn = sqlite3.connect(db_path, timeout=15)
+        try:
+            conn.execute("PRAGMA busy_timeout=15000")
+            try: conn.execute("PRAGMA journal_mode=WAL")
+            except sqlite3.DatabaseError: pass
+            conn.execute("DELETE FROM attendance")
+            conn.commit()
+            logger.info("All local attendance records/reports were cleared; staff records preserved.")
+        finally: conn.close()
+        create_table()
+
+    def confirm_reset_database(self):
+        """Require the administrator reset password before clearing attendance."""
+        self._dismiss_active_menu()
+        try:
+            if getattr(self, "_reset_dialog", None):
+                self._reset_dialog.dismiss()
+        except Exception:
+            pass
+
+        box = MDBoxLayout(orientation="vertical", spacing=dp(12), padding=[dp(8), dp(8), dp(8), dp(4)],
+                          size_hint_y=None, height=dp(72))
+        field = MDTextField(hint_text="Reset password", password=True, mode="rectangle",
+                            helper_text="Enter administrator password", helper_text_mode="persistent")
+        box.add_widget(field)
+        self._reset_password_field = field
+
+        self._reset_dialog = MDDialog(
+            title="Reset Database",
+            text="Enter the administrator password to permanently clear local attendance records. Staff registrations will be preserved.",
+            type="custom",
+            content_cls=box,
+            buttons=[
+                MDFlatButton(text="CANCEL", on_release=lambda *a: self._reset_dialog.dismiss()),
+                MDFlatButton(text="RESET", theme_text_color="Custom", text_color=(0.8,0.1,0.1,1),
+                              on_release=lambda *a: self._verify_reset_password()),
+            ],
+        )
+        self._reset_dialog.open()
+
+    def _verify_reset_password(self):
+        """Only reset when the exact administrator password is supplied."""
+        entered = str(getattr(self, "_reset_password_field", None).text if getattr(self, "_reset_password_field", None) else "")
+        if entered != REPORT_EXPORT_PASSWORD:
+            try:
+                self._reset_password_field.error = True
+                self._reset_password_field.helper_text = "Incorrect password. Database was NOT reset."
+            except Exception:
+                pass
+            logger.warning("Database reset rejected: incorrect password.")
+            return
+        self._do_confirmed_reset()
+
+    def _do_confirmed_reset(self):
+        if getattr(self, "_reset_dialog", None):
+            try: self._reset_dialog.dismiss()
+            except Exception: pass
+        self.reset_database_tables()
+        try: self.update_dashboard_metrics()
+        except Exception: logger.exception("Could not refresh attendance summary after clearing history.")
+        try:
+            if hasattr(self, "settings_screen") and "reset_status_label" in self.settings_screen.ids:
+                self.settings_screen.ids.reset_status_label.text = "Attendance history cleared. Staff registrations were preserved."
+        except Exception: pass
+
+    # -----------------------------
+    # Google link / endpoint field lock (Server Connection & Settings)
+    # -----------------------------
+    def unlock_google_links(self):
+        """Require the administrator password before revealing/editing Google links & endpoints."""
+        self._dismiss_active_menu()
+        try:
+            if getattr(self, "_google_links_dialog", None):
+                self._google_links_dialog.dismiss()
+        except Exception:
+            pass
+
+        box = MDBoxLayout(orientation="vertical", spacing=dp(12), padding=[dp(8), dp(8), dp(8), dp(4)],
+                          size_hint_y=None, height=dp(72))
+        field = MDTextField(hint_text="Reset password", password=True, mode="rectangle",
+                            helper_text="Enter administrator password", helper_text_mode="persistent")
+        box.add_widget(field)
+        self._google_links_password_field = field
+
+        self._google_links_dialog = MDDialog(
+            title="Unlock Google Links",
+            text="Enter the administrator password to view or edit the Google Sheet links and upload endpoints.",
+            type="custom",
+            content_cls=box,
+            buttons=[
+                MDFlatButton(text="CANCEL", on_release=lambda *a: self._google_links_dialog.dismiss()),
+                MDFlatButton(text="UNLOCK", theme_text_color="Custom", text_color=(0.13, 0.40, 0.16, 1),
+                              on_release=lambda *a: self._verify_google_links_password()),
+            ],
+        )
+        self._google_links_dialog.open()
+
+    def _verify_google_links_password(self):
+        """Only unlock when the exact administrator (Reset Database) password is supplied."""
+        entered = str(getattr(self, "_google_links_password_field", None).text
+                       if getattr(self, "_google_links_password_field", None) else "")
+        if entered != REPORT_EXPORT_PASSWORD:
+            try:
+                self._google_links_password_field.error = True
+                self._google_links_password_field.helper_text = "Incorrect password. Google links remain locked."
+            except Exception:
+                pass
+            logger.warning("Google links unlock rejected: incorrect password.")
+            return
+        if getattr(self, "_google_links_dialog", None):
+            try: self._google_links_dialog.dismiss()
+            except Exception: pass
+        self.google_links_unlocked = True
+        logger.info("Google links/endpoints unlocked by administrator.")
+
+    def lock_google_links(self):
+        """Re-lock the Google link/endpoint fields. No password required to lock."""
+        self.google_links_unlocked = False
+
+    def open_settings_screen(self):
+        """Navigate to the app's own Settings screen (not Kivy's built-in config panel)."""
+        self._dismiss_active_menu()
+        self._refresh_connection_status_labels()
+        if hasattr(self, "settings_screen") and hasattr(self.settings_screen, "ids"):
+            if "reminders_switch" in self.settings_screen.ids:
+                self.settings_screen.ids.reminders_switch.active = self._load_reminders_enabled()
+        self.root.current = "settings"
+
+    def _refresh_connection_status_labels(self):
+        """Updates the Settings screen's DB connection status label from
+        pg_sync's live state. Called both when the user opens Settings and
+        right after a background auto-connect/auto-sync attempt completes,
+        so the label reflects reality without needing a manual screen visit."""
+        try:
+            if hasattr(self, "settings_screen") and hasattr(self.settings_screen, "ids"):
+                if "server_status_label" in self.settings_screen.ids:
+                    status = pg_sync.get_status()
+                    state = "Connected" if status["connected"] else "Not connected"
+                    lbl = self.settings_screen.ids.server_status_label
+                    lbl.text = f"{state} · {status['pending_count']} record(s) pending sync"
+                    lbl.theme_text_color = "Custom"
+                    lbl.text_color = (0.1, 0.6, 0.2, 1) if status["connected"] else (0.6, 0.15, 0.15, 1)
+        except Exception:
+            logger.exception("Could not refresh connection status label:")
+
+    def open_server_connection(self):
+        self._dismiss_active_menu()
+        self.refresh_server_connection_screen()
+        self.root.current = "server_connection"
+        # Test all configured report links in parallel so their individual
+        # green/red status badges reflect the real connection state.
+        Clock.schedule_once(lambda dt: self._auto_test_excel_links(), 0.2)
+
+    def _auto_test_excel_links(self):
+        for report_type in ("attendance", "timesheet", "leave", "staff", "cfm", "dwpt", "monthly_report"):
+            self.connect_excel_report(report_type)
+
+    def refresh_server_connection_screen(self):
+        """Populates the Server Connection screen fields/status from saved config + live state."""
+        if not (hasattr(self, "server_connection_screen") and hasattr(self.server_connection_screen, "ids")):
+            return
+        ids = self.server_connection_screen.ids
+        config = pg_sync.load_config()
+
+        field_map = {
+            "server_name_field": "server_name",
+            "host_field": "host",
+            "port_field": "port",
+            "dbname_field": "dbname",
+            "username_field": "username",
+            "password_field": "password",
+        }
+        for widget_id, key in field_map.items():
+            if widget_id in ids:
+                ids[widget_id].text = str(config.get(key) or "")
+
+        if "sslmode_field" in ids:
+            ids.sslmode_field.text = config.get("sslmode") or "prefer"
+
+        if "google_form_url_field" in ids:
+            ids.google_form_url_field.text = self._load_google_form_url()
+        self._load_google_form_auto_sync_status()
+        self._refresh_excel_sync_fields()
+        self._refresh_dhis2_fields()
+
+        status = pg_sync.get_status()
+        status_color = (0.1, 0.6, 0.2, 1) if status["connected"] else (0.6, 0.15, 0.15, 1)
+        status_bg = (0.85, 0.93, 0.85, 1) if status["connected"] else (0.93, 0.85, 0.85, 1)
+        if "connection_status_label" in ids:
+            ids.connection_status_label.text = "Connected" if status["connected"] else "Not Connected"
+            ids.connection_status_label.theme_text_color = "Custom"
+            ids.connection_status_label.text_color = status_color
+        if "connection_status_icon" in ids:
+            ids.connection_status_icon.icon = "check-circle" if status["connected"] else "close-circle"
+            ids.connection_status_icon.text_color = status_color
+        if "connection_status_badge" in ids:
+            ids.connection_status_badge.md_bg_color = status_bg
+        if "last_sync_label" in ids:
+            ids.last_sync_label.text = f"Last Sync: {status['last_sync_time']}"
+        if "sync_result_label" in ids:
+            ids.sync_result_label.text = f"{status['pending_count']} record(s) pending sync."
+
+    def _collect_server_connection_form(self):
+        ids = self.server_connection_screen.ids
+        port_text = ids.port_field.text.strip() if "port_field" in ids else "5432"
+        try:
+            port = int(port_text) if port_text else 5432
+        except ValueError:
+            port = 5432
+        return {
+            "server_name": ids.server_name_field.text.strip() if "server_name_field" in ids else "",
+            "host": ids.host_field.text.strip() if "host_field" in ids else "",
+            "port": port,
+            "dbname": ids.dbname_field.text.strip() if "dbname_field" in ids else "",
+            "username": ids.username_field.text.strip() if "username_field" in ids else "",
+            "password": ids.password_field.text if "password_field" in ids else "",
+            "sslmode": ids.sslmode_field.text.strip() if "sslmode_field" in ids else "prefer",
+        }
+
+    # -----------------------------
+    # Excel link / folder connection
+    # -----------------------------
+    def _set_excel_link_status(self, report_type, connected, message=""):
+        """Update one report link's green/red connection indicator."""
+        try:
+            ids = self.server_connection_screen.ids
+            icon_id = f"{report_type}_connection_icon"
+            label_id = f"{report_type}_connection_label"
+            badge_id = f"{report_type}_connection_badge"
+            color = (0.10, 0.60, 0.20, 1) if connected else (0.80, 0.10, 0.10, 1)
+            bg = (0.86, 0.95, 0.87, 1) if connected else (0.96, 0.87, 0.87, 1)
+            if icon_id in ids:
+                ids[icon_id].icon = "check-circle" if connected else "close-circle"
+                ids[icon_id].text_color = color
+            if label_id in ids:
+                ids[label_id].text = "Connected" if connected else "Not Connected"
+                ids[label_id].theme_text_color = "Custom"
+                ids[label_id].text_color = color
+            if badge_id in ids:
+                ids[badge_id].md_bg_color = bg
+            self._excel_sync_state.setdefault("link_status", {})[report_type] = bool(connected)
+            if message and hasattr(ids, "excel_sync_result_label"):
+                ids.excel_sync_result_label.text = message
+            _save_excel_sync_config(self._excel_sync_state)
+            self._update_excel_sync_dashboard_status()
+        except Exception:
+            logger.exception("Could not update Excel link status for %s", report_type)
+
+    def connect_excel_report(self, report_type):
+        """Test one report link in the background and show green/red status."""
+        url = str(self._excel_sync_state.get(f"{report_type}_link") or "").strip()
+        # CFM may be configured with an Apps Script endpoint before a separate
+        # Drive/Sheet browse link is supplied. Test the protected endpoint in
+        # that case without exposing or changing the stored database settings.
+        if report_type == "cfm" and not url:
+            url = str(self._excel_sync_state.get("cfm_endpoint") or "").strip()
+        if not url.startswith(("http://", "https://")):
+            self._set_excel_link_status(report_type, False, f"{report_type.title()} link is missing or invalid.")
+            return
+        self._set_excel_link_status(report_type, False, f"Connecting to {report_type.title()} link...")
+        def worker():
+            try:
+                req = Request(url, headers={"User-Agent": "ROHI-Attendance-App/1.7"}, method="GET")
+                with urlopen(req, timeout=10, context=ROHI_SSL_CONTEXT) as response:
+                    status = getattr(response, "status", 200)
+                    response.read(256)
+                ok = 200 <= status < 400
+                msg = f"{report_type.title()} link connected." if ok else f"{report_type.title()} link failed (HTTP {status})."
+            except Exception as exc:
+                logger.exception("Excel link connection test failed for %s", report_type)
+                ok = False
+                msg = f"{report_type.title()} link failed: {exc}"
+            Clock.schedule_once(lambda dt: self._set_excel_link_status(report_type, ok, msg), 0)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _refresh_excel_sync_fields(self):
+        if not hasattr(self, "server_connection_screen"):
+            return
+        ids = self.server_connection_screen.ids
+        mapping = {
+            "attendance_link_field": "attendance_link",
+            "timesheet_link_field": "timesheet_link",
+            "leave_link_field": "leave_link",
+            "staff_link_field": "staff_link",
+            "cfm_link_field": "cfm_link",
+            "dwpt_link_field": "dwpt_link",
+            "monthly_report_link_field": "monthly_report_link",
+            "attendance_endpoint_field": "attendance_endpoint",
+            "timesheet_endpoint_field": "timesheet_endpoint",
+            "leave_endpoint_field": "leave_endpoint",
+            "staff_endpoint_field": "staff_endpoint",
+            "cfm_endpoint_field": "cfm_endpoint",
+            "dwpt_endpoint_field": "dwpt_endpoint",
+            "monthly_report_endpoint_field": "monthly_report_endpoint",
+        }
+        for widget_id, key in mapping.items():
+            if widget_id in ids:
+                ids[widget_id].text = str(self._excel_sync_state.get(key) or "")
+        statuses = self._excel_sync_state.get("link_status", {})
+        for report_type in ("attendance", "timesheet", "leave", "staff", "cfm", "dwpt", "monthly_report"):
+            self._set_excel_link_status(report_type, bool(statuses.get(report_type, False)))
+        self._update_excel_sync_dashboard_status()
+
+    def _collect_excel_sync_form(self):
+        ids = self.server_connection_screen.ids
+        data = dict(self._excel_sync_state)
+        mapping = {
+            "attendance_link_field": "attendance_link",
+            "timesheet_link_field": "timesheet_link",
+            "leave_link_field": "leave_link",
+            "staff_link_field": "staff_link",
+            "cfm_link_field": "cfm_link",
+            "dwpt_link_field": "dwpt_link",
+            "monthly_report_link_field": "monthly_report_link",
+            "attendance_endpoint_field": "attendance_endpoint",
+            "timesheet_endpoint_field": "timesheet_endpoint",
+            "leave_endpoint_field": "leave_endpoint",
+            "staff_endpoint_field": "staff_endpoint",
+            "cfm_endpoint_field": "cfm_endpoint",
+            "dwpt_endpoint_field": "dwpt_endpoint",
+            "monthly_report_endpoint_field": "monthly_report_endpoint",
+        }
+        for widget_id, key in mapping.items():
+            if widget_id in ids:
+                data[key] = ids[widget_id].text.strip()
+        return data
+
+    def save_excel_sync_settings(self):
+        data = self._collect_excel_sync_form()
+        self._excel_sync_state = data
+        ok = _save_excel_sync_config(data)
+        message = "Excel links saved." if ok else "Could not save Excel links."
+        if hasattr(self.server_connection_screen.ids, "excel_sync_result_label"):
+            self.server_connection_screen.ids.excel_sync_result_label.text = message
+        self._update_excel_sync_dashboard_status()
+        # Server links/endpoints are administrator-only. Re-lock immediately
+        # after saving so they cannot remain editable on the screen.
+        self.google_links_unlocked = False
+        return ok
+
+    # -----------------------------
+    # DHIS2 integration
+    # -----------------------------
+    DHIS2_FIELD_MAP = {
+        "dhis2_server_url": "server_url",
+        "dhis2_username": "username",
+        "dhis2_password": "password",
+        "dhis2_api_token": "api_token",
+        "dhis2_org_unit": "org_unit",
+        "dhis2_tracked_entity_type": "tracked_entity_type",
+        "dhis2_program": "program",
+        "dhis2_program_stage": "program_stage",
+        "dhis2_tea_staff_id": "tea_staff_id",
+        "dhis2_tea_full_name": "tea_full_name",
+        "dhis2_de_check_in": "de_check_in",
+        "dhis2_de_check_out": "de_check_out",
+        "dhis2_de_late": "de_late",
+        "dhis2_de_gps_status": "de_gps_status",
+        "dhis2_agg_data_set": "agg_data_set",
+        "dhis2_agg_de_present": "agg_de_present",
+        "dhis2_agg_de_absent": "agg_de_absent",
+        "dhis2_agg_de_late": "agg_de_late",
+    }
+
+    def _refresh_dhis2_fields(self):
+        if not hasattr(self, "server_connection_screen"):
+            return
+        ids = self.server_connection_screen.ids
+        for widget_id, key in self.DHIS2_FIELD_MAP.items():
+            if widget_id in ids:
+                ids[widget_id].text = str(self._dhis2_state.get(key) or "")
+        if "dhis2_status_label" in ids:
+            ids.dhis2_status_label.text = self._dhis2_state.get("last_status") or "Not connected"
+
+    def _collect_dhis2_form(self):
+        ids = self.server_connection_screen.ids
+        data = dict(self._dhis2_state)
+        for widget_id, key in self.DHIS2_FIELD_MAP.items():
+            if widget_id in ids:
+                data[key] = ids[widget_id].text.strip()
+        return data
+
+    def save_dhis2_settings(self):
+        data = self._collect_dhis2_form()
+        self._dhis2_state = data
+        ok = _save_dhis2_config(data)
+        message = "DHIS2 settings saved." if ok else "Could not save DHIS2 settings."
+        data["last_status"] = message
+        self._dhis2_state = data
+        if hasattr(self.server_connection_screen.ids, "dhis2_status_label"):
+            self.server_connection_screen.ids.dhis2_status_label.text = message
+        return ok
+
+    def test_dhis2_connection(self):
+        data = self._collect_dhis2_form()
+        self._dhis2_state = data
+        _save_dhis2_config(data)
+        server_url = data.get("server_url", "")
+        if not server_url:
+            self._set_dhis2_status("Enter the DHIS2 server URL first.", False)
+            return
+
+        def worker():
+            ok, message = dhis2_sync.test_connection(
+                server_url, data.get("username", ""), data.get("password", ""),
+                token=data.get("api_token") or None,
+            )
+            Clock.schedule_once(lambda dt: self._set_dhis2_status(message, ok), 0)
+        threading.Thread(target=worker, daemon=True).start()
+
+    @mainthread
+    def _set_dhis2_status(self, message, ok=True):
+        self._dhis2_state["connected"] = bool(ok)
+        self._dhis2_state["last_status"] = message
+        _save_dhis2_config(self._dhis2_state)
+        if hasattr(self, "server_connection_screen") and "dhis2_status_label" in self.server_connection_screen.ids:
+            self.server_connection_screen.ids.dhis2_status_label.text = message
+
+    def push_attendance_to_dhis2(self):
+        """Push every row of the currently generated attendance report
+        (Attendance Reports screen) to DHIS2 as individual tracker events,
+        one per staff attendance day. Requires the DHIS2 metadata UIDs to
+        be configured and a DHIS2 Tracked Entity UID already linked to the
+        logged-in staff member (see ``dhis2_tei`` on the staff record)."""
+        cfg = self._dhis2_state
+        missing = [k for k in ("server_url", "org_unit", "program", "program_stage", "tracked_entity_type") if not cfg.get(k)]
+        if missing:
+            self._set_report_send_status(f"DHIS2 not configured yet ({', '.join(missing)}).", False)
+            return
+        rows = getattr(self, "_last_report_rows", [])
+        if not rows:
+            self._set_report_send_status("Generate the report first, then push to DHIS2.", False)
+            return
+        user = self.current_user
+        tei = str(user[30]) if user and len(user) > 30 and user[30] else ""
+        if not tei:
+            self._set_report_send_status(
+                "This staff member has no DHIS2 Tracked Entity UID linked yet.", False
+            )
+            return
+
+        def worker():
+            sent, failed = 0, 0
+            for check_in, check_out, late, status, gps, checkout_gps in rows:
+                if not check_in:
+                    continue
+                event_date = check_in[:10]
+                data_values = {}
+                if cfg.get("de_check_in"):
+                    data_values[cfg["de_check_in"]] = check_in
+                if cfg.get("de_check_out") and check_out:
+                    data_values[cfg["de_check_out"]] = check_out
+                if cfg.get("de_late"):
+                    data_values[cfg["de_late"]] = "Yes" if (status and "Late" in status) else "No"
+                if cfg.get("de_gps_status") and status:
+                    data_values[cfg["de_gps_status"]] = status
+                ok, _ = dhis2_sync.push_attendance_event(
+                    cfg["server_url"], cfg.get("username", ""), cfg.get("password", ""),
+                    cfg["program"], cfg["program_stage"], cfg["org_unit"], tei, cfg["tracked_entity_type"],
+                    event_date, data_values, token=cfg.get("api_token") or None,
+                )
+                sent += 1 if ok else 0
+                failed += 0 if ok else 1
+            message = f"DHIS2: {sent} event(s) sent" + (f", {failed} failed." if failed else ".")
+            Clock.schedule_once(lambda dt: self._set_report_send_status(message, failed == 0), 0)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def push_summary_to_dhis2(self):
+        """Push the on-screen Present/Absent/Late period totals to DHIS2 as
+        one aggregate data value set for the selected reporting period."""
+        cfg = self._dhis2_state
+        missing = [k for k in ("server_url", "org_unit", "agg_data_set", "agg_de_present", "agg_de_absent") if not cfg.get(k)]
+        if missing:
+            self._set_report_send_status(f"DHIS2 aggregate not configured yet ({', '.join(missing)}).", False)
+            return
+        ids = self.reports_screen.ids
+        try:
+            present = int(re.search(r"\d+", ids.report_present_label.text).group())
+            absent = int(re.search(r"\d+", ids.report_absent_label.text).group())
+            late = int(re.search(r"\d+", ids.report_late_label.text).group())
+        except Exception:
+            self._set_report_send_status("Generate the report first, then push to DHIS2.", False)
+            return
+
+        month_name = ids.report_month_spinner.text
+        year = ids.report_year_spinner.text
+        try:
+            month_num = list(calendar.month_name).index(month_name)
+            period = f"{year}{month_num:02d}"
+        except Exception:
+            period = datetime.now().strftime("%Y%m")
+
+        def worker():
+            ok, message = dhis2_sync.push_aggregate_summary(
+                cfg["server_url"], cfg.get("username", ""), cfg.get("password", ""),
+                cfg["org_unit"], period, cfg["agg_data_set"],
+                cfg["agg_de_present"], cfg["agg_de_absent"],
+                present, absent,
+                late_data_element=cfg.get("agg_de_late") or None, late_count=late,
+                token=cfg.get("api_token") or None,
+            )
+            Clock.schedule_once(lambda dt: self._set_report_send_status(message, ok), 0)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def connect_excel_sync(self):
+        data = self._collect_excel_sync_form()
+        links = [data.get(k, "") for k in (
+            "attendance_link", "timesheet_link", "leave_link", "staff_link",
+            "cfm_link", "dwpt_link", "monthly_report_link"
+        )]
+        valid = all(u.startswith(("http://", "https://")) for u in links if u)
+        if not valid:
+            if hasattr(self.server_connection_screen.ids, "excel_sync_result_label"):
+                self.server_connection_screen.ids.excel_sync_result_label.text = "Use valid http:// or https:// links."
+            return False
+        self._excel_sync_state = data
+        _save_excel_sync_config(data)
+        endpoint_count = sum(bool(data.get(k)) for k in (
+            "attendance_endpoint", "timesheet_endpoint", "leave_endpoint", "staff_endpoint",
+            "cfm_endpoint", "dwpt_endpoint", "monthly_report_endpoint"
+        ))
+        message = (
+            f"Connected: {len([u for u in links if u])}/7 report links saved. "
+            f"{endpoint_count}/7 upload endpoints configured."
+        )
+        if hasattr(self.server_connection_screen.ids, "excel_sync_result_label"):
+            self.server_connection_screen.ids.excel_sync_result_label.text = message
+        self._update_excel_sync_dashboard_status()
+        return True
+
+    def open_excel_sync_link(self, report_type):
+        url = str(self._excel_sync_state.get(f"{report_type}_link") or "").strip()
+        if not url:
+            return
+        if platform != "android":
+            return
+        try:
+            from jnius import autoclass
+            Intent = autoclass("android.content.Intent")
+            Uri = autoclass("android.net.Uri")
+            activity = self._get_android_activity()
+            activity.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+        except Exception as exc:
+            logger.exception("Could not open Excel sync link:")
+            if hasattr(self.server_connection_screen.ids, "excel_sync_result_label"):
+                self.server_connection_screen.ids.excel_sync_result_label.text = f"Could not open link: {exc}"
+
+    def _update_excel_sync_dashboard_status(self):
+        try:
+            if not hasattr(self, "dashboard_screen"):
+                return
+            ids = self.dashboard_screen.ids
+            statuses = self._excel_sync_state.get("link_status", {})
+            connected_count = sum(bool(statuses.get(k, False)) for k in ("attendance", "timesheet", "leave", "staff"))
+            if "excel_sync_status" in ids:
+                if connected_count == 7:
+                    ids.excel_sync_status.text = "Excel Sync: CONNECTED (7/7)"
+                    ids.excel_sync_status.text_color = (0.13, 0.40, 0.16, 1)
+                elif connected_count > 0:
+                    ids.excel_sync_status.text = f"Excel Sync: {connected_count}/7 CONNECTED"
+                    ids.excel_sync_status.text_color = (0.75, 0.55, 0.05, 1)
+                else:
+                    ids.excel_sync_status.text = "Excel Sync: NOT CONNECTED"
+                    ids.excel_sync_status.text_color = (0.8, 0.1, 0.1, 1)
+        except Exception:
+            logger.exception("Could not update Excel sync dashboard status.")
+
+    # -----------------------------
+    # Server Connection actions
+    # -----------------------------
+    # NOTE: pg8000 network calls (test/connect/sync) are blocking. Running them
+    # directly on the on_release handler used to freeze the whole app - no
+    # button feedback, no repaint - for as long as the TCP attempt took (which
+    # can be 30s+ against an unreachable host), which looked exactly like "the
+    # server connection isn't working" even when the credentials were fine.
+    # Every action below now runs on a background thread; only the quick,
+    # local UI updates (busy state, then the result) touch widgets, and those
+    # are marshalled back to the main thread with @mainthread.
+    def _set_server_connection_busy(self, busy, busy_text=None):
+        if not (hasattr(self, "server_connection_screen") and hasattr(self.server_connection_screen, "ids")):
+            return
+        ids = self.server_connection_screen.ids
+        for btn_id in ("test_connection_btn", "save_settings_btn", "connect_btn",
+                       "disconnect_btn", "sync_now_btn"):
+            if btn_id in ids:
+                ids[btn_id].disabled = busy
+                ids[btn_id].opacity = 0.5 if busy else 1
+        if busy and busy_text and "connection_status_label" in ids:
+            ids.connection_status_label.text = busy_text
+            ids.connection_status_label.theme_text_color = "Custom"
+            ids.connection_status_label.text_color = (0.75, 0.55, 0.05, 1)  # amber = in progress
+            if "connection_status_icon" in ids:
+                ids.connection_status_icon.icon = "timer-sand"
+                ids.connection_status_icon.text_color = (0.75, 0.55, 0.05, 1)
+            if "connection_status_badge" in ids:
+                ids.connection_status_badge.md_bg_color = (0.96, 0.92, 0.82, 1)
+
+    def _run_server_action(self, busy_text, worker_fn, on_done_fn):
+        """Runs worker_fn() on a background thread, then marshals on_done_fn
+        (its return value) back to the UI thread."""
+        self._set_server_connection_busy(True, busy_text)
+
+        def _worker():
+            try:
+                result = worker_fn()
+            except Exception as e:
+                logger.exception("Server connection action failed:")
+                result = (False, f"Unexpected error: {e}")
+            self._server_action_done(result, on_done_fn)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    @mainthread
+    def _server_action_done(self, result, on_done_fn):
+        self._set_server_connection_busy(False)
+        on_done_fn(result)
+
+    def server_connection_test(self):
+        config = self._collect_server_connection_form()
+        self._run_server_action(
+            "Testing connection...",
+            lambda: pg_sync.test_connection(config),
+            lambda result: self._on_test_connection_done(result),
+        )
+
+    def _on_test_connection_done(self, result):
+        ok, message = result
+        self._set_sync_result_label(message, ok=ok)
+        # Testing doesn't change the live connection - restore the label to
+        # reflect actual connection state rather than leaving "Testing..." up.
+        self.refresh_server_connection_screen()
+
+    def server_connection_save(self):
+        config = self._collect_server_connection_form()
+        ok, message = pg_sync.save_config(config)
+        self._set_sync_result_label(message, ok=ok)
+
+    def server_connection_connect(self):
+        """Connect. Per the app's sync policy, a successful connect immediately
+        triggers a sync of any pending local rows (auto-sync-on-reconnect)."""
+        config = self._collect_server_connection_form()
+        pg_sync.save_config(config)
+        self._run_server_action(
+            "Connecting...",
+            lambda: pg_sync.connect(config, auto_sync=True),
+            lambda result: self._on_connect_done(result),
+        )
+
+    def _on_connect_done(self, result):
+        ok, message = result
+        self._set_sync_result_label(message, ok=ok)
+        self.refresh_server_connection_screen()
+
+    def server_connection_disconnect(self):
+        self._run_server_action(
+            "Disconnecting...",
+            lambda: pg_sync.disconnect(),
+            lambda result: self._on_disconnect_done(result),
+        )
+
+    def _on_disconnect_done(self, result):
+        ok, message = result
+        self._set_sync_result_label(message, ok=ok)
+        self.refresh_server_connection_screen()
+
+    def server_connection_sync_now(self):
+        config = self._collect_server_connection_form()
+        self._run_server_action(
+            "Synchronizing...",
+            lambda: pg_sync.synchronize_now(config),
+            lambda result: self._on_sync_now_done(result),
+        )
+
+    def _on_sync_now_done(self, result):
+        ok, message = result[0], result[1]
+        self._set_sync_result_label(message, ok=ok)
+        self.refresh_server_connection_screen()
+
+    def _set_sync_result_label(self, message, ok=None):
+        if hasattr(self, "server_connection_screen") and hasattr(self.server_connection_screen, "ids"):
+            ids = self.server_connection_screen.ids
+            if "sync_result_label" in ids:
+                ids.sync_result_label.text = message
+                if ok is True:
+                    ids.sync_result_label.theme_text_color = "Custom"
+                    ids.sync_result_label.text_color = (0.13, 0.40, 0.16, 1)
+                elif ok is False:
+                    ids.sync_result_label.theme_text_color = "Custom"
+                    ids.sync_result_label.text_color = (0.8, 0.1, 0.1, 1)
+                else:
+                    ids.sync_result_label.theme_text_color = "Secondary"
+        logger.info(f"[Server Connection] {message}")
+
+    # -----------------------------
+    # Session persistence with a 15-minute inactivity/background timeout
+    # -----------------------------
+    def _mark_user_activity(self, *args):
+        """Reset the 15-minute inactivity timer whenever the staff member interacts with the app."""
+        self._last_user_activity_monotonic = time.monotonic()
+        self._idle_logout_notice = False
+        return False
+
+    def _idle_session_tick(self, dt=None):
+        """Log out an authenticated staff member after 15 minutes of no app activity."""
+        if not self.current_user:
+            return
+        idle_for = time.monotonic() - float(self._last_user_activity_monotonic or time.monotonic())
+        if idle_for >= STAFF_IDLE_TIMEOUT_SECONDS and not self._idle_logout_notice:
+            self._idle_logout_notice = True
+            logger.info("Automatic logout after %.0f seconds of staff inactivity.", idle_for)
+            self.logout(auto=True)
+
+    def _save_session_activity_marker(self):
+        """Persist the last activity/background marker so a killed/backgrounded app cannot restore an expired session."""
+        try:
+            path = self._session_file()
+            if not os.path.exists(path):
+                return
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            data["last_activity_at"] = datetime.now().isoformat()
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            logger.exception("Could not update session activity marker.")
+
+    def on_pause(self):
+        """Remember when Android backgrounds the app for the 15-minute session timeout."""
+        if self.current_user:
+            self._backgrounded_at_monotonic = time.monotonic()
+            self._save_session_activity_marker()
+        return True
+
+    def on_resume(self):
+        """Check background duration before allowing a previously authenticated session to continue."""
+        if self.current_user and self._backgrounded_at_monotonic is not None:
+            elapsed = time.monotonic() - self._backgrounded_at_monotonic
+            if elapsed >= STAFF_IDLE_TIMEOUT_SECONDS:
+                logger.info("Automatic logout after %.0f seconds in background.", elapsed)
+                self._backgrounded_at_monotonic = None
+                self.logout(auto=True)
+                return
+        self._backgrounded_at_monotonic = None
+        self._mark_user_activity()
+
+    def _session_file(self):
+        return os.path.join(APP_DIR, "session.json")
+
+    def _save_login_session(self, email):
+        try:
+            with open(self._session_file(), "w", encoding="utf-8") as f:
+                json.dump({"email": str(email).strip().lower(), "saved_at": datetime.now().isoformat(), "last_activity_at": datetime.now().isoformat()}, f)
+        except Exception:
+            logger.exception("Could not save login session.")
+
+    def _clear_login_session(self):
+        try:
+            path = self._session_file()
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            logger.exception("Could not clear login session.")
+
+    def _restore_or_open_login(self, dt=None):
+        if self.current_user:
+            return
+        try:
+            path = self._session_file()
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                last_activity = str(data.get("last_activity_at") or data.get("saved_at") or "").strip()
+                if last_activity:
+                    try:
+                        elapsed = (datetime.now() - datetime.fromisoformat(last_activity)).total_seconds()
+                        if elapsed >= STAFF_IDLE_TIMEOUT_SECONDS:
+                            logger.info("Stored session expired after %.0f seconds of inactivity.", elapsed)
+                            self._clear_login_session()
+                            self.root.current = "login"
+                            return
+                    except Exception:
+                        logger.exception("Could not validate stored session age; continuing with normal restore.")
+                email = str(data.get("email") or "").strip().lower()
+                if email:
+                    db_path = os.path.join(APP_DIR, "attendance.db")
+                    conn = sqlite3.connect(db_path, timeout=10)
+                    try:
+                        user = conn.execute(
+                            "SELECT * FROM staff WHERE LOWER(TRIM(email)) = ? LIMIT 1", (email,)
+                        ).fetchone()
+                    finally:
+                        conn.close()
+                    if user:
+                        self.current_user = self._ensure_unique_id(user)
+                        self._mark_user_activity()
+                        self._save_login_session(email)
+                        self._populate_dashboard_from_current_user()
+                        self.verify_existing_checkin(email)
+                        self.update_dashboard_metrics()
+                        self.root.current = "dashboard"
+                        logger.info("Restored authenticated session for %s.", email)
+                        return
+        except Exception:
+            logger.exception("Could not restore login session; showing login screen.")
+        self.root.current = "login"
+
+    # -----------------------------
+    # Navigation & Profile Edit Binding
+    # -----------------------------
+    def open_login(self, dt=None):
+        self.root.current = "login"
+
+    def open_registration(self):
+        # A phone may hold only one staff registration. Editing the
+        # already-logged-in profile is always allowed; starting a brand
+        # new registration is blocked once any staff record exists locally.
+        if not self.current_user:
+            try:
+                already_registered = get_staff_count() > 0
+            except Exception:
+                logger.exception("Failed to check existing staff count before registration.")
+                already_registered = False
+
+            if already_registered:
+                self._show_registration_error(
+                    "Already Registered",
+                    "This phone already has a registered staff account.\n\n"
+                    "Only one staff registration is allowed per phone. "
+                    "Please log in with the existing account below, or "
+                    "contact your administrator if this phone needs to be reset."
+                )
+                return
+
+        self.populate_registration_for_edit()
+        self.root.current = "registration"
+
+    def populate_registration_for_edit(self):
+        """Pre-fills registration screen fields with logged-in staff profile data."""
+        if not self.current_user:
+            return
+        
+        try:
+            reg_ids = self.registration_screen.ids
+            user = self.current_user
+
+            field_mapping = {
+                'fullname': user[1],
+                'sex': user[2],
+                'dob': user[3],
+                'blood_group': user[4],
+                'marital_status': user[5],
+                'nationality': user[6],
+                'state_origin': user[7],
+                'lga': user[8],
+                'address': user[9],
+                'next_of_kin': user[10],
+                'next_of_kin_phone': user[11],
+                'employment_type': user[12],
+                'state_office': user[13],
+                'cluster': user[14],
+                'department': user[15],
+                'section': user[16],
+                'position': user[17],
+                'staff_number': user[18],
+                'phone': user[19],
+                'email': user[20],
+                'facebook': user[21],
+                'twitter': user[22],
+                'instagram': user[23],
+                'telegram': user[24],
+                'linkedin': user[25],
+                'gps_coordinate': user[26]
+            }
+
+            for field_id, value in field_mapping.items():
+                if hasattr(reg_ids, field_id) and value is not None:
+                    getattr(reg_ids, field_id).text = str(value)
+
+            # Cache the office GPS coordinate on the app (used by submit_staff)
+            # and show it in the read-only field so editing a profile doesn't
+            # wipe the geofence coordinate tied to the staff member's office.
+            self._selected_office_gps_coordinate = user[26] if len(user) > 26 and user[26] else ""
+            if hasattr(reg_ids, 'gps_coordinate') and self._selected_office_gps_coordinate:
+                reg_ids.gps_coordinate.text = self._selected_office_gps_coordinate
+
+            # Genotype and Re-integrated fields were removed from the
+            # registration form, so their stored values (if any, from
+            # older records) are intentionally no longer displayed.
+
+            if hasattr(reg_ids, 'photo_preview') and len(user) > 27 and user[27]:
+                if os.path.exists(user[27]):
+                    reg_ids.photo_preview.source = user[27]
+
+            logger.info("Registration form pre-filled with active user profile.")
+        except Exception:
+            logger.exception("Error populating registration form for profile edit:")
+
+    def open_settings(self):
+        """Open Settings from the dashboard cog or navigation drawer."""
+        try:
+            self._dismiss_active_menu()
+        except Exception:
+            pass
+        self.root.current = "settings"
+        try:
+            self.refresh_server_connection_screen()
+        except Exception:
+            logger.exception("Could not refresh Settings screen.")
+
+    def open_external_link(self, url, label="link"):
+        """Open an external URL in Android's default browser."""
+        url = str(url or "").strip()
+        if not url:
+            self.show_link_pending(label)
+            return False
+        if not (url.startswith("http://") or url.startswith("https://")):
+            url = "https://" + url
+        try:
+            if platform == "android":
+                from jnius import autoclass
+                Intent = autoclass("android.content.Intent")
+                Uri = autoclass("android.net.Uri")
+                self._get_android_activity().startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+            else:
+                import webbrowser
+                webbrowser.open(url)
+            return True
+        except Exception:
+            logger.exception("Could not open %s link", label)
+            return False
+
+    def show_link_pending(self, label):
+        dialog = MDDialog(
+            title=str(label),
+            text=f"The {label} link will be provided shortly.",
+            buttons=[MDFlatButton(text="OK", on_release=lambda x: dialog.dismiss())]
+        )
+        dialog.open()
+
+    def open_google_meeting(self):
+        """Prefer the installed Google Meet app, otherwise use the Meet URL."""
+        url = ROHI_EXTERNAL_LINKS["meet"]
+        if platform != "android":
+            return self.open_external_link(url, "Google Meet")
+        try:
+            from jnius import autoclass
+            Intent = autoclass("android.content.Intent")
+            Uri = autoclass("android.net.Uri")
+            activity = self._get_android_activity()
+            intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+            intent.setPackage("com.google.android.apps.meetings")
+            if intent.resolveActivity(activity.getPackageManager()) is not None:
+                activity.startActivity(intent)
+                return True
+        except Exception:
+            logger.exception("Google Meet app launch failed; using browser fallback.")
+        return self.open_external_link(url, "Google Meet")
+
+    def open_dashboard_gmail(self):
+        """Open Gmail directly and attach the most recent generated report when available."""
+        if platform != "android":
+            return self.open_external_link("https://mail.google.com/", "Gmail")
+        path = getattr(self, "_last_export_path", None)
+        if path and os.path.exists(path):
+            ok = self._share_file_via_android(
+                path, "ROHI Report", "Attached is the selected ROHI report.",
+                lambda msg: logger.info("Dashboard Gmail: %s", msg),
+                package_name="com.google.android.gm",
+            )
+            if ok:
+                return True
+            return self.open_external_link("https://mail.google.com/", "Gmail")
+        try:
+            from jnius import autoclass
+            Intent = autoclass("android.content.Intent")
+            Uri = autoclass("android.net.Uri")
+            activity = self._get_android_activity()
+            intent = Intent(Intent.ACTION_SENDTO, Uri.parse("mailto:"))
+            intent.setPackage("com.google.android.gm")
+            activity.startActivity(intent)
+            return True
+        except Exception:
+            logger.exception("Gmail app not available; opening Gmail in browser.")
+            return self.open_external_link("https://mail.google.com/", "Gmail")
+
+    def open_dashboard(self):
+        self.root.current = "dashboard"
+        try:
+            self.refresh_cfm_cases()
+        except Exception:
+            pass
+
+    def logout(self, auto=False):
+        logger.info("User logged out%s.", " automatically after inactivity" if auto else "")
+        self.checked_in = False
+        self.check_in_datetime = None
+        self.check_out_datetime = None
+        self.current_user = None
+        self._clear_login_session()
+        self._last_user_activity_monotonic = time.monotonic()
+        self._backgrounded_at_monotonic = None
+        self.root.current = "login"
+
+    def forgot_password(self):
+        logger.info("Forgot password triggered.")
+
+    def _populate_dashboard_from_current_user(self):
+        """Fills every dashboard profile field from self.current_user. Used both
+        right after login and right after a profile edit is saved, so the two
+        can never drift out of sync (this was the cause of edited profiles still
+        showing old staff ID/email after saving)."""
+        if not self.current_user:
+            return
+        user = self.current_user
+        fullname = str(user[1]) if len(user) > 1 and user[1] else "Staff Member"
+        position = str(user[17]) if len(user) > 17 and user[17] else "MEAL Officer"
+        staff_num = str(user[18]) if len(user) > 18 and user[18] else "ROHI/MIU/P/067"
+        unique_id = str(user[29]) if len(user) > 29 and user[29] else "-"
+        email_val = str(user[20]) if len(user) > 20 and user[20] else ""
+        state_office = str(user[13]) if len(user) > 13 and user[13] else ""
+        cluster = str(user[14]) if len(user) > 14 and user[14] else ""
+        registered_gps = str(user[26]) if len(user) > 26 and user[26] else self.static_gps
+        photo_path = str(user[27]) if len(user) > 27 and user[27] else ""
+
+        dash_ids = self.dashboard_screen.ids
+        try:
+            leave_counts = get_leave_status_counts(email_val)
+            if hasattr(dash_ids, 'leave_pending_count'):
+                dash_ids.leave_pending_count.text = str(leave_counts.get("Pending", 0))
+            if hasattr(dash_ids, 'leave_approved_count'):
+                dash_ids.leave_approved_count.text = str(leave_counts.get("Approved", 0))
+            if hasattr(dash_ids, 'leave_rejected_count'):
+                dash_ids.leave_rejected_count.text = str(leave_counts.get("Rejected", 0))
+        except Exception:
+            logger.exception("Unable to populate leave status counts on dashboard")
+        if hasattr(dash_ids, 'welcome_label'):
+            dash_ids.welcome_label.text = f"Welcome, {fullname}"
+        if hasattr(dash_ids, 'role_label'):
+            dash_ids.role_label.text = f"Position: {position}"
+        if hasattr(dash_ids, 'email_label'):
+            dash_ids.email_label.text = f"Email: {email_val}"
+        if hasattr(dash_ids, 'staff_id_label'):
+            dash_ids.staff_id_label.text = f"Staff ID: {staff_num}"
+        if hasattr(dash_ids, 'unique_id_label'):
+            dash_ids.unique_id_label.text = f"Unique ID: {unique_id}"
+        if hasattr(dash_ids, 'state_office_label'):
+            dash_ids.state_office_label.text = f"State Office: {state_office}" if state_office else "State Office: -"
+        if hasattr(dash_ids, 'cluster_label'):
+            dash_ids.cluster_label.text = f"Cluster: {cluster}" if cluster else "Cluster: -"
+        if hasattr(dash_ids, 'static_gps_label'):
+            dash_ids.static_gps_label.text = registered_gps
+        if hasattr(dash_ids, 'current_gps_label'):
+            dash_ids.current_gps_label.text = self.current_location
+        if hasattr(dash_ids, 'dash_photo') and photo_path and os.path.exists(photo_path):
+            dash_ids.dash_photo.source = photo_path
+        self._update_excel_sync_dashboard_status()
+
+        return email_val
+
+    def perform_login(self):
+        """Authenticates user and populates Dashboard UI with user records."""
+        logger.info("perform_login triggered")
+        try:
+            login_screen = self.root.get_screen("login")
+            email_or_staff = login_screen.ids.email.text.strip()
+            password = login_screen.ids.password.text.strip()
+
+            if not email_or_staff or not password:
+                logger.warning("Login attempt with empty fields.")
+                self._show_login_error("Please enter your email/staff number and password.")
+                return
+
+            logger.info(f"Authenticating login for user/staff ID: {email_or_staff}")
+            user = verify_login(email_or_staff, password)
+
+            if not user:
+                logger.warning(f"Failed login attempt for '{email_or_staff}': Invalid credentials.")
+                self._show_login_error("Incorrect email/staff number or password.")
+                return
+
+            logger.info(f"User '{email_or_staff}' authenticated successfully.")
+            self.current_user = self._ensure_unique_id(user)
+            self._mark_user_activity()
+            self._save_login_session(str(self.current_user[20]) if len(self.current_user) > 20 else email_or_staff)
+
+            # From here on, authentication has already succeeded - the user IS
+            # logged in. Everything below is populating the dashboard, which
+            # must NOT be allowed to strand the user back on the login screen
+            # on failure (previously a single exception in this block - e.g. a
+            # stale/partial local schema - would be silently swallowed by the
+            # outer except and leave root.current on "login" with no feedback,
+            # even though current_user was already set. That looked like "login
+            # doesn't work" and could only be worked around by going through
+            # Register > Edit Profile, which has its own success path to the
+            # dashboard). So each step here is isolated and non-fatal.
+            try:
+                email_val = self._populate_dashboard_from_current_user() or email_or_staff
+            except Exception:
+                logger.exception("Failed to populate dashboard after login (non-fatal):")
+                email_val = email_or_staff
+
+            try:
+                self.verify_existing_checkin(email_val)
+            except Exception:
+                logger.exception("Failed to verify existing check-in after login (non-fatal):")
+
+            try:
+                self.update_dashboard_metrics()
+            except Exception:
+                logger.exception("Failed to update dashboard metrics after login (non-fatal):")
+
+            self.root.current = "dashboard"
+        except Exception:
+            logger.exception("Exception during perform_login:")
+            self._show_login_error("Something went wrong logging in. Please try again.")
+
+    def _show_login_error(self, message):
+        """Surfaces login problems on-screen instead of failing silently -
+        previously a failed/errored login attempt gave no visible feedback at
+        all, so it just looked like the LOGIN button did nothing."""
+        try:
+            login_screen = self.root.get_screen("login")
+            if hasattr(login_screen.ids, "login_error_label"):
+                login_screen.ids.login_error_label.text = message
+        except Exception:
+            logger.exception("Failed to display login error label:")
+
+    # -----------------------------
+    # Geofencing & Daily Reset Helpers
+    # -----------------------------
+    @staticmethod
+    def _parse_coordinate(coord_str):
+        """Parses a 'lat° N, lon° E' style string into (lat, lon) floats.
+        Handles S/W negatives too. Returns None if the string can't be parsed."""
+        if not coord_str:
+            return None
+        try:
+            import re
+            matches = re.findall(r"(-?\d+\.?\d*)\s*°?\s*([NSEW]?)", coord_str.upper())
+            nums = [m for m in matches if m[0]]
+            if len(nums) < 2:
+                return None
+            lat = float(nums[0][0])
+            if nums[0][1] == 'S':
+                lat = -abs(lat)
+            lon = float(nums[1][0])
+            if nums[1][1] == 'W':
+                lon = -abs(lon)
+            return lat, lon
+        except Exception:
+            return None
+
+    def _distance_meters(self, coord_a, coord_b):
+        """Great-circle (Haversine) distance in meters between two coordinate strings.
+        Returns None if either coordinate can't be parsed."""
+        a = self._parse_coordinate(coord_a)
+        b = self._parse_coordinate(coord_b)
+        if not a or not b:
+            return None
+
+        lat1, lon1 = a
+        lat2, lon2 = b
+        R = 6371000  # Earth radius in meters
+
+        phi1, phi2 = math.radians(lat1), math.radians(lat2)
+        d_phi = math.radians(lat2 - lat1)
+        d_lambda = math.radians(lon2 - lon1)
+
+        h = (math.sin(d_phi / 2) ** 2
+             + math.cos(phi1) * math.cos(phi2) * math.sin(d_lambda / 2) ** 2)
+        return 2 * R * math.asin(min(1, math.sqrt(h)))
+
+    def _get_android_activity(self):
+        """Return the active Android Activity."""
+        candidates = (
+            "org.kivy.android.PythonActivity",
+            "org.renpy.android.PythonActivity",
+        )
+        last_error = None
+        try:
+            from jnius import autoclass
+            for name in candidates:
+                try:
+                    cls = autoclass(name)
+                    activity = getattr(cls, "mActivity", None)
+                    if activity is not None:
+                        return activity
+                except Exception as exc:
+                    last_error = exc
+        except Exception as exc:
+            last_error = exc
+        raise RuntimeError(f"Android Activity is unavailable: {last_error}")
+
+    def _ensure_location_permission(self):
+        """Check/request Android location permission before Check-In GPS capture."""
+        if platform != "android":
+            return True
+
+        try:
+            from android.permissions import request_permissions, check_permission, Permission
+            fine = bool(check_permission(Permission.ACCESS_FINE_LOCATION))
+            coarse = bool(check_permission(Permission.ACCESS_COARSE_LOCATION))
+            if fine or coarse:
+                return True
+            self._checkin_pending = True
+            request_permissions(
+                [Permission.ACCESS_FINE_LOCATION, Permission.ACCESS_COARSE_LOCATION],
+                self._on_location_permission_result
+            )
+            return False
+        except Exception:
+            logger.exception("Android location permission check/request failed.")
+            self._show_gps_failure("Location permission could not be requested. Open Android Settings > Apps > ROHI IMS > Permissions > Location and allow Precise Location, then try Check-In again.")
+            try:
+                self.dashboard_screen.ids.check_in_btn.disabled = False
+            except Exception:
+                pass
+            return False
+
+    @mainthread
+    def _on_location_permission_result(self, permissions, grants):
+        try:
+            granted = any(bool(g) for g in grants)
+        except Exception:
+            granted = False
+        if granted and self._checkin_pending:
+            self._start_live_checkin_gps()
+        elif self._checkin_pending:
+            self._checkin_pending = False
+            if self.dashboard_screen:
+                self._show_gps_failure(
+                    "Location permission is required. Allow Precise Location for ROHI Attendance, then press Check-In again."
+                )
+            try:
+                self.dashboard_screen.ids.check_in_btn.disabled = False
+            except Exception:
+                pass
+
+    def _cancel_gps_timeout(self):
+        if self._gps_timeout_event is not None:
+            try:
+                self._gps_timeout_event.cancel()
+            except Exception:
+                pass
+            self._gps_timeout_event = None
+
+    def _start_android_location_polling(self):
+        """Poll Android last-known location as a reliability fallback.
+
+        Some Android builds successfully register LocationManager callbacks
+        but never deliver the Java listener callback. Polling getLastKnownLocation
+        still receives the provider's updated device fix and avoids the intermittent
+        "no fresh GPS fix" failure seen on those builds.
+        """
+        if platform != "android":
+            return
+        try:
+            from jnius import autoclass
+            Context = autoclass("android.content.Context")
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            manager = PythonActivity.mActivity.getSystemService(Context.LOCATION_SERVICE)
+            LocationManager = autoclass("android.location.LocationManager")
+            providers = []
+            for provider in (LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER):
+                try:
+                    if manager.isProviderEnabled(provider):
+                        providers.append(provider)
+                except Exception:
+                    pass
+            if not providers:
+                return
+
+            old_stop = self._gps_poll_stop
+            if old_stop is not None:
+                try:
+                    old_stop.set()
+                except Exception:
+                    pass
+            stop_event = threading.Event()
+            self._gps_poll_stop = stop_event
+
+            def worker():
+                deadline = time.time() + 32
+                last_signature = None
+                while not stop_event.is_set() and time.time() < deadline and self._checkin_pending:
+                    best = None
+                    now_ms = int(time.time() * 1000)
+                    for provider in providers:
+                        try:
+                            loc = manager.getLastKnownLocation(provider)
+                            if loc is None:
+                                continue
+                            lat = float(loc.getLatitude())
+                            lon = float(loc.getLongitude())
+                            accuracy = float(loc.getAccuracy()) if loc.hasAccuracy() else 9999.0
+                            loc_time = int(loc.getTime())
+                            # Some Android providers return 0 for the timestamp
+                            # even though the coordinate itself is valid. Treat timestamp 0
+                            # as unknown age, not as an ancient location.
+                            age_s = max(0.0, (now_ms - loc_time) / 1000.0) if loc_time > 0 else 0.0
+                            if accuracy <= 150.0 and (loc_time <= 0 or age_s <= 600.0):
+                                candidate = (accuracy, age_s, lat, lon)
+                                if best is None or candidate[:2] < best[:2]:
+                                    best = candidate
+                        except Exception:
+                            continue
+                    if best is not None:
+                        accuracy, age_s, lat, lon = best
+                        signature = (round(lat, 6), round(lon, 6), round(accuracy, 1))
+                        if signature != last_signature:
+                            last_signature = signature
+                            logger.info("Android GPS poll fix: %.7f, %.7f accuracy=%.1fm age=%.1fs", lat, lon, accuracy, age_s)
+                            Clock.schedule_once(
+                                lambda dt, la=lat, lo=lon, ac=accuracy: self._on_android_location(la, lo, ac),
+                                0
+                            )
+                            return
+                    time.sleep(1.0)
+
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception:
+            logger.exception("Android GPS polling fallback failed")
+
+    def _start_live_checkin_gps(self):
+        """Start Plyer GPS and an Android LocationManager fallback.
+
+        Some Android combinations do not deliver a Plyer callback even
+        though Location is enabled. The Android fallback asks LocationManager
+        for a real device fix. A check-in is never approved from the office
+        target coordinate itself.
+        """
+        self._cancel_gps_timeout()
+        started = False
+        try:
+            gps.configure(on_location=self._on_checkin_gps, on_status=self.gps_status)
+            gps.start(minTime=500, minDistance=0)
+            started = True
+            logger.info("Plyer GPS started for Check-In.")
+        except Exception:
+            logger.exception("Plyer GPS start failed; Android LocationManager fallback will be attempted.")
+
+        if platform == "android":
+            # LocationManager/pyjnius fallback is used only in the packaged
+            # python-for-android APK.
+            # attempts a runtime permission request through pyjnius.
+            try:
+                from android.permissions import check_permission, Permission
+                fine = bool(check_permission(Permission.ACCESS_FINE_LOCATION))
+                coarse = bool(check_permission(Permission.ACCESS_COARSE_LOCATION))
+            except ImportError:
+                fine = coarse = False
+            except Exception:
+                fine = coarse = False
+
+            if fine or coarse:
+                try:
+                    self._start_android_location_fallback()
+                    self._start_android_location_polling()
+                    started = True
+                except Exception:
+                    logger.exception("Android LocationManager fallback failed.")
+
+        if not started:
+            self._checkin_pending = False
+            self._show_gps_failure(
+                "GPS could not be started. Turn ON Location/GPS and make sure the device allows ROHI to use location, then try again."
+            )
+            try:
+                self.dashboard_screen.ids.check_in_btn.disabled = False
+            except Exception:
+                pass
+            return
+
+        # Give both providers enough time to obtain a satellite/network fix.
+        self._gps_timeout_event = Clock.schedule_once(self._checkin_gps_timeout, 30)
+
+    def _start_android_location_fallback(self):
+        """Request a real Android location fix when Plyer is unreliable."""
+        from jnius import autoclass, PythonJavaClass, java_method
+        LocationManager = autoclass('android.location.LocationManager')
+        Looper = autoclass('android.os.Looper')
+        Context = autoclass('android.content.Context')
+
+        app_context = None
+        try:
+            app_context = self._get_android_activity()
+        except Exception:
+            try:
+                app_context = self._android_context
+            except Exception:
+                pass
+        if app_context is None:
+            raise RuntimeError("Android activity context unavailable")
+
+        manager = app_context.getSystemService(Context.LOCATION_SERVICE)
+        if manager is None:
+            raise RuntimeError("Android LocationManager unavailable")
+
+        outer = self
+
+        class LocationListener(PythonJavaClass):
+            __javainterfaces__ = ['android/location/LocationListener']
+            __javacontext__ = 'app'
+
+            @java_method('(Landroid/location/Location;)V')
+            def onLocationChanged(self, location):
+                try:
+                    if location is not None:
+                        lat = float(location.getLatitude())
+                        lon = float(location.getLongitude())
+                        accuracy = float(location.getAccuracy()) if location.hasAccuracy() else None
+                        logger.info("Android LocationManager fix: %.7f, %.7f accuracy=%s", lat, lon, accuracy)
+                        outer._on_android_location(lat, lon, accuracy)
+                except Exception:
+                    logger.exception("Android location callback failed")
+
+            @java_method('(Ljava/lang/String;I)V')
+            def onStatusChanged(self, provider, status):
+                pass
+
+            @java_method('(Ljava/lang/String;)V')
+            def onProviderEnabled(self, provider):
+                logger.info("Android location provider enabled: %s", provider)
+
+            @java_method('(Ljava/lang/String;)V')
+            def onProviderDisabled(self, provider):
+                logger.warning("Android location provider disabled: %s", provider)
+
+        listener = LocationListener()
+        self._android_location_listener = listener
+
+        providers = []
+        try:
+            if manager.isProviderEnabled(LocationManager.GPS_PROVIDER):
+                providers.append(LocationManager.GPS_PROVIDER)
+        except Exception:
+            pass
+        try:
+            if manager.isProviderEnabled(LocationManager.NETWORK_PROVIDER):
+                providers.append(LocationManager.NETWORK_PROVIDER)
+        except Exception:
+            pass
+        if not providers:
+            raise RuntimeError("No Android location provider is enabled")
+
+        # A recent last-known fix is useful as a fast fallback, but only when
+        # it is recent and reasonably accurate. It is still the phone's GPS,
+        # never the office coordinate. We do NOT accept the office coordinate.
+        now_ms = int(time.time() * 1000)
+        best_last = None
+        for provider in providers:
+            try:
+                last = manager.getLastKnownLocation(provider)
+                if last is not None:
+                    last_time = int(last.getTime())
+                    age_ms = max(0, now_ms - last_time) if last_time > 0 else 0
+                    accuracy = float(last.getAccuracy()) if last.hasAccuracy() else 9999.0
+                    logger.info("Android last-known %s: age=%ss accuracy=%sm timestamp=%s", provider, age_ms / 1000.0, accuracy, last_time)
+                    if (last_time <= 0 or age_ms <= 900000) and accuracy <= 150.0:
+                        candidate = (age_ms, accuracy, float(last.getLatitude()), float(last.getLongitude()))
+                        if best_last is None or candidate[:2] < best_last[:2]:
+                            best_last = candidate
+            except Exception:
+                logger.exception("Could not read Android last-known location from %s", provider)
+
+        # First request live updates from every enabled provider. This is more
+        # reliable on Android than requestSingleUpdate, which can fail
+        # silently on some devices. The first good fix finalizes Check-In.
+        requested = False
+        for provider in providers:
+            try:
+                manager.requestLocationUpdates(provider, 1000, 0.0, listener, Looper.getMainLooper())
+                requested = True
+                logger.info("Android live location updates requested from %s", provider)
+            except Exception:
+                logger.exception("Could not request live Android location updates from %s", provider)
+
+        # Use a recent phone fix immediately when available. The live listener and
+        # polling fallback continue in parallel, but this removes the Android
+        # race where callbacks never arrive even though LocationManager has a valid fix.
+        if best_last is not None:
+            _, accuracy, lat, lon = best_last
+            logger.info("Using recent Android phone location immediately: age/accuracy candidate=%s", best_last[:2])
+            self._on_android_location(lat, lon, accuracy)
+            return
+        if not requested:
+            raise RuntimeError("Android could not register any live location provider")
+
+    @mainthread
+    def _on_android_location(self, lat, lon, accuracy=None):
+        if not self._checkin_pending:
+            return
+        # Do not accept a wildly inaccurate location as proof of being at the office.
+        if accuracy is not None and accuracy > 150:
+            logger.warning("Ignoring inaccurate Android location: accuracy=%.1fm", accuracy)
+            return
+        self._checkin_gps_fix = (float(lat), float(lon))
+        self.current_location = f"{float(lat):.6f}° N, {float(lon):.6f}° E"
+        logger.info("Fresh Android GPS accepted for Check-In: %s accuracy=%s", self.current_location, accuracy)
+        self._cancel_gps_timeout()
+        try:
+            gps.stop()
+        except Exception:
+            pass
+        self._stop_android_location_updates()
+        self._finalize_check_in()
+
+    def _stop_android_location_updates(self):
+        """Stop Android LocationManager callbacks and polling after a fix or timeout."""
+        try:
+            if getattr(self, "_gps_poll_stop", None) is not None:
+                self._gps_poll_stop.set()
+                self._gps_poll_stop = None
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_checkout_gps_poll_stop", None) is not None:
+                self._checkout_gps_poll_stop.set()
+                self._checkout_gps_poll_stop = None
+        except Exception:
+            pass
+        try:
+            if platform != "android" or not getattr(self, "_android_location_listener", None):
+                return
+            from jnius import autoclass
+            Context = autoclass("android.content.Context")
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            manager = PythonActivity.mActivity.getSystemService(Context.LOCATION_SERVICE)
+            if manager is not None:
+                manager.removeUpdates(self._android_location_listener)
+                logger.info("Android live location updates stopped.")
+        except Exception:
+            logger.exception("Could not stop Android location updates")
+        finally:
+            self._android_location_listener = None
+
+    def _nearest_configured_office(self, current_gps):
+        """Return (office_name, distance_m) for the nearest configured ROHI office."""
+        best_name, best_distance = None, None
+        if not current_gps:
+            return None, None
+        for name in STATE_OFFICES:
+            office = OFFICES.get(name)
+            if not office:
+                continue
+            target = f"{office['latitude']:.7f}, {office['longitude']:.7f}"
+            distance = self._distance_meters(target, current_gps)
+            if distance is not None and (best_distance is None or distance < best_distance):
+                best_name, best_distance = name, distance
+        return best_name, best_distance
+
+    def _check_geofence(self, current_gps=None):
+        """Validate a live coordinate against all configured ROHI offices.
+        Registration State Office remains the home office; assignment travel can
+        be captured at another configured state office without re-registration."""
+        if current_gps is None:
+            current_gps = self.current_location
+        if not current_gps:
+            return False, None
+        office_name, distance = self._nearest_configured_office(current_gps)
+        if office_name:
+            radius = float(OFFICES[office_name].get("radius") or self.GEOFENCE_RADIUS_METERS)
+            logger.info("Geofence check: current='%s', nearest='%s', distance=%.1fm, radius=%.1fm",
+                        current_gps, office_name, distance, radius)
+            return distance <= radius, distance
+        return False, None
+
+    @staticmethod
+    def _reset_threshold(dt):
+        """Returns the next 6:00 PM boundary strictly after dt.
+        Used so a Check-In/Check-Out stays static for the rest of the day
+        and only clears at 6:00 PM to allow the next morning's check-in."""
+        threshold = dt.replace(hour=18, minute=0, second=0, microsecond=0)
+        if dt >= threshold:
+            threshold += timedelta(days=1)
+        return threshold
+
+    def _reset_attendance_state(self, dash_ids=None):
+        """Clears the static Check-In/Out session state (called at the 6PM boundary)."""
+        self.checked_in = False
+        self.check_in_datetime = None
+        self.check_out_datetime = None
+        self.late_duration_str = "On Time"
+        if dash_ids is None and getattr(self, 'dashboard_screen', None):
+            dash_ids = self.dashboard_screen.ids
+        if not dash_ids:
+            return
+        if hasattr(dash_ids, 'clock_in_time_label'):
+            dash_ids.clock_in_time_label.text = "Not Checked In"
+        if hasattr(dash_ids, 'clock_out_time_label'):
+            dash_ids.clock_out_time_label.text = "Not Checked Out"
+        if hasattr(dash_ids, 'punctuality_status'):
+            today = datetime.now()
+            if self._is_attendance_working_day(today):
+                dash_ids.punctuality_status.text = "Absent (Check-In Required)"
+                dash_ids.punctuality_status.text_color = (0.8, 0.1, 0.1, 1)
+            elif today.weekday() == 4:
+                dash_ids.punctuality_status.text = "Work From Home (Friday)"
+                dash_ids.punctuality_status.text_color = (0.2, 0.4, 0.8, 1)
+            else:
+                dash_ids.punctuality_status.text = "Non-Working Day"
+                dash_ids.punctuality_status.text_color = (0.4, 0.4, 0.4, 1)
+        if hasattr(dash_ids, 'hours_late_label'):
+            dash_ids.hours_late_label.text = "Late by: 0m (On Time)"
+        if hasattr(dash_ids, 'trend_today_status'):
+            dash_ids.trend_today_status.text = "Pending"
+            dash_ids.trend_today_status.text_color = (0.5, 0.5, 0.5, 1)
+        if hasattr(dash_ids, 'check_in_btn'):
+            dash_ids.check_in_btn.disabled = False
+        if hasattr(dash_ids, 'check_out_btn'):
+            dash_ids.check_out_btn.disabled = True
+        if hasattr(dash_ids, 'geofence_note_label'):
+            dash_ids.geofence_note_label.text = "Not Checked In Yet"
+            dash_ids.geofence_note_label.text_color = (0.5, 0.5, 0.5, 1)
+        if hasattr(dash_ids, 'geofence_icon'):
+            dash_ids.geofence_icon.icon = "map-marker-question"
+            dash_ids.geofence_icon.text_color = (0.5, 0.5, 0.5, 1)
+        if hasattr(dash_ids, 'geofence_status_card'):
+            dash_ids.geofence_status_card.md_bg_color = (0.95, 0.95, 0.95, 1)
+        if hasattr(dash_ids, 'current_gps_label'):
+            dash_ids.current_gps_label.text = "Not Checked In Yet"
+        if hasattr(dash_ids, 'checkout_geofence_note_label'):
+            dash_ids.checkout_geofence_note_label.text = "Not Checked Out Yet"
+            dash_ids.checkout_geofence_note_label.text_color = (0.5, 0.5, 0.5, 1)
+        if hasattr(dash_ids, 'checkout_geofence_icon'):
+            dash_ids.checkout_geofence_icon.icon = "map-marker-question"
+            dash_ids.checkout_geofence_icon.text_color = (0.5, 0.5, 0.5, 1)
+        if hasattr(dash_ids, 'checkout_geofence_status_card'):
+            dash_ids.checkout_geofence_status_card.md_bg_color = (0.95, 0.95, 0.95, 1)
+        if hasattr(dash_ids, 'checkout_gps_label'):
+            dash_ids.checkout_gps_label.text = "Not Checked Out Yet"
+
+    # -----------------------------
+    # 24-Hour Static Check-In/Out State Engine
+    # -----------------------------
+    def verify_existing_checkin(self, email):
+        """Restores static check-in/out and attendance status if within 24 hours of last record."""
+        db_path = os.path.join(os.path.dirname(__file__), "attendance.db")
+        if not os.path.exists(db_path):
+            return
+
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT check_in_time, check_out_time, late_duration, attendance_status, gps_location, check_out_gps_location FROM attendance 
+            WHERE email=? ORDER BY id DESC LIMIT 1
+        ''', (email,))
+        record = cursor.fetchone()
+        conn.close()
+
+        dash_ids = self.dashboard_screen.ids
+
+        if record:
+            last_check_in_str = record[0]
+            last_check_out_str = record[1]
+            last_check_in_gps = record[4] if len(record) > 4 else None
+            last_check_out_gps = record[5] if len(record) > 5 else None
+            
+            if last_check_in_str and last_check_in_str != "":
+                last_check_in = datetime.strptime(last_check_in_str, "%Y-%m-%d %H:%M:%S")
+            else:
+                last_check_in = None
+
+            if last_check_out_str and last_check_out_str != "":
+                last_check_out = datetime.strptime(last_check_out_str, "%Y-%m-%d %H:%M:%S")
+            else:
+                last_check_out = None
+            
+            now = datetime.now()
+
+            # Valid until the next 6:00 PM boundary after check-in; after that,
+            # the session resets so the staff member can check in again the next morning.
+            if last_check_in and now < self._reset_threshold(last_check_in):
+                self.checked_in = True
+                self.check_in_datetime = last_check_in
+                self.check_out_datetime = last_check_out
+                self.late_duration_str = record[2] or "On Time"
+                
+                if hasattr(dash_ids, 'clock_in_time_label'):
+                    dash_ids.clock_in_time_label.text = last_check_in.strftime('%I:%M %p')
+                if hasattr(dash_ids, 'check_in_btn'):
+                    dash_ids.check_in_btn.disabled = True
+
+                # Restore the Check-In GPS/geofence status box so it doesn't look like
+                # nothing was captured just because the app was closed and reopened.
+                if last_check_in_gps:
+                    self.current_location = last_check_in_gps
+                    self._last_checkin_gps = last_check_in_gps
+                    within_range, distance = self._check_geofence(last_check_in_gps)
+                    if hasattr(dash_ids, 'current_gps_label'):
+                        dash_ids.current_gps_label.text = last_check_in_gps
+                    note = (f"Captured Within Office ({distance:.0f} m)" if within_range and distance is not None
+                            else f"Not Within Office Range ({distance:.0f} m away)" if distance is not None
+                            else "Captured")
+                    color = (0.1, 0.5, 0.15, 1) if within_range else (0.8, 0.1, 0.1, 1)
+                    if hasattr(dash_ids, 'geofence_note_label'):
+                        dash_ids.geofence_note_label.text = note
+                        dash_ids.geofence_note_label.text_color = color
+                    if hasattr(dash_ids, 'geofence_icon'):
+                        dash_ids.geofence_icon.icon = "map-marker-check" if within_range else "map-marker-alert"
+                        dash_ids.geofence_icon.text_color = color
+                    if hasattr(dash_ids, 'geofence_status_card'):
+                        dash_ids.geofence_status_card.md_bg_color = (
+                            (0.88, 0.95, 0.88, 1) if within_range else (0.97, 0.88, 0.88, 1)
+                        )
+
+                if last_check_out:
+                    if hasattr(dash_ids, 'clock_out_time_label'):
+                        dash_ids.clock_out_time_label.text = last_check_out.strftime('%I:%M %p')
+                    # Already checked out today -> keep the button locked and restore
+                    # its GPS/geofence status box too (this was previously left blank,
+                    # which made a re-opened app look like Check-Out never registered).
+                    if hasattr(dash_ids, 'check_out_btn'):
+                        dash_ids.check_out_btn.disabled = True
+                    if last_check_out_gps:
+                        out_within, out_distance = self._check_geofence(last_check_out_gps)
+                        if hasattr(dash_ids, 'checkout_gps_label'):
+                            dash_ids.checkout_gps_label.text = last_check_out_gps
+                        out_note = (f"Captured Within Office ({out_distance:.0f} m)" if out_within and out_distance is not None
+                                    else f"Not Within Office Range ({out_distance:.0f} m away)" if out_distance is not None
+                                    else "Captured")
+                        out_color = (0.1, 0.5, 0.15, 1) if out_within else (0.8, 0.1, 0.1, 1)
+                        if hasattr(dash_ids, 'checkout_geofence_note_label'):
+                            dash_ids.checkout_geofence_note_label.text = out_note
+                            dash_ids.checkout_geofence_note_label.text_color = out_color
+                        if hasattr(dash_ids, 'checkout_geofence_icon'):
+                            dash_ids.checkout_geofence_icon.icon = "map-marker-check" if out_within else "map-marker-alert"
+                            dash_ids.checkout_geofence_icon.text_color = out_color
+                        if hasattr(dash_ids, 'checkout_geofence_status_card'):
+                            dash_ids.checkout_geofence_status_card.md_bg_color = (
+                                (0.88, 0.95, 0.88, 1) if out_within else (0.97, 0.88, 0.88, 1)
+                            )
+                else:
+                    if hasattr(dash_ids, 'clock_out_time_label'):
+                        dash_ids.clock_out_time_label.text = "Pending"
+                    # Not checked out yet -> make sure the button is actually usable
+                    # (it may have been left disabled by a previous session/crash).
+                    if hasattr(dash_ids, 'check_out_btn'):
+                        dash_ids.check_out_btn.disabled = False
+
+                status_text = record[3] or "Present (On Time)"
+                if hasattr(dash_ids, 'punctuality_status'):
+                    dash_ids.punctuality_status.text = status_text
+                    if "Late" in status_text:
+                        dash_ids.punctuality_status.text_color = (0.9, 0.5, 0, 1) # Yellow
+                    elif "Present" in status_text:
+                        dash_ids.punctuality_status.text_color = (0.1, 0.6, 0.2, 1) # Green
+                    else:
+                        dash_ids.punctuality_status.text_color = (0.8, 0.1, 0.1, 1) # Red
+
+                if hasattr(dash_ids, 'hours_late_label'):
+                    dash_ids.hours_late_label.text = (
+                        "Late by: 0m (On Time)" if self.late_duration_str == "On Time"
+                        else f"Late by: {self.late_duration_str}"
+                    )
+                return
+
+        # No valid same-day check-in found (new staff member, or the previous
+        # session already rolled past the 6PM boundary) - fully reset every
+        # dashboard label via _reset_attendance_state() so nothing is left
+        # showing a stale value or the raw kv placeholder text. (Previously
+        # this duplicated only part of that reset - e.g. hours_late_label,
+        # trend_today_status and the geofence boxes were never touched here,
+        # so on a normal fresh-day login they were stuck on whatever text was
+        # hardcoded in dashboard.kv, such as "Hrs Late: 00:00 Mins".)
+        self._reset_attendance_state(dash_ids)
+
+    def update_dashboard_time(self, dt=None):
+        """Updates dynamic clocks and handles daily reset/expiration at 8:00 AM cycle."""
+        try:
+            now = datetime.now()
+            formatted_time = now.strftime("%A, %d %B %Y | %I:%M:%S %p")
+            dash_ids = self.dashboard_screen.ids
+            
+            if hasattr(dash_ids, 'live_time_label'):
+                dash_ids.live_time_label.text = formatted_time
+
+            # Handle automatic expiration / reset once the 6:00 PM boundary passes,
+            # clearing the static Check-In/Out state for the next morning.
+            if self.checked_in and self.check_in_datetime:
+                if now >= self._reset_threshold(self.check_in_datetime):
+                    self._reset_attendance_state(dash_ids)
+
+            if hasattr(dash_ids, 'punctuality_status') and not self.checked_in:
+                if self._is_attendance_working_day(now):
+                    work_start_time = now.replace(hour=8, minute=0, second=0, microsecond=0)
+                    if now > work_start_time:
+                        dash_ids.punctuality_status.text = "Absent (Check-In Required)"
+                        dash_ids.punctuality_status.text_color = (0.8, 0.1, 0.1, 1)
+                elif now.weekday() == 4:
+                    dash_ids.punctuality_status.text = "Work From Home (Friday)"
+                    dash_ids.punctuality_status.text_color = (0.2, 0.4, 0.8, 1)
+                else:
+                    dash_ids.punctuality_status.text = "Non-Working Day"
+                    dash_ids.punctuality_status.text_color = (0.4, 0.4, 0.4, 1)
+        except Exception:
+            logger.exception("Error in update_dashboard_time:")
+
+    def update_dashboard_metrics(self):
+        """Calculates working hours today, monthly working days, and real
+        present/absent/late/punctuality figures from the attendance table."""
+        try:
+            now = datetime.now()
+            dash_ids = self.dashboard_screen.ids
+
+            weekday = now.weekday()
+            if hasattr(dash_ids, 'expected_hours_today'):
+                if weekday < 4:
+                    dash_ids.expected_hours_today.text = "9 Hours"
+                elif weekday == 4:
+                    dash_ids.expected_hours_today.text = "WFH - Attendance Not Captured"
+                else:
+                    dash_ids.expected_hours_today.text = "0 Hours (Weekend)"
+
+            year, month = now.year, now.month
+            num_days = calendar.monthrange(year, month)[1]
+            # Attendance working days are Monday-Thursday only. Friday is WFH
+            # and is deliberately excluded from attendance-day totals.
+            work_days = sum(1 for day in range(1, num_days + 1) if calendar.weekday(year, month, day) in (0, 1, 2, 3))
+            work_days_elapsed = sum(
+                1 for day in range(1, now.day + 1) if calendar.weekday(year, month, day) in (0, 1, 2, 3)
+            )
+
+            if hasattr(dash_ids, 'total_work_days'):
+                dash_ids.total_work_days.text = f"{work_days} Days"
+
+            days_present = 0
+            days_late = 0
+
+            email_val = str(self.current_user[20]) if self.current_user and len(self.current_user) > 20 else None
+            if email_val:
+                db_path = os.path.join(os.path.dirname(__file__), "attendance.db")
+                if os.path.exists(db_path):
+                    conn = sqlite3.connect(db_path)
+                    cursor = conn.cursor()
+                    month_prefix = f"{year:04d}-{month:02d}-"
+                    cursor.execute(
+                        '''
+                        SELECT check_in_time, attendance_status FROM attendance
+                        WHERE email = ? AND check_in_time LIKE ?
+                        ''',
+                        (email_val, f"{month_prefix}%"),
+                    )
+                    rows = cursor.fetchall()
+                    conn.close()
+
+                    present_days_seen = set()
+                    for check_in_time, status in rows:
+                        if not check_in_time:
+                            continue
+                        day_key = check_in_time[:10]
+                        present_days_seen.add(day_key)
+                        if status and "Late" in status:
+                            days_late += 1
+                    days_present = len(present_days_seen)
+
+            # Missing attendance rows are not automatic absences.
+            days_absent = 0
+            if email_val:
+                db_path = os.path.join(APP_DIR, "attendance.db")
+                if os.path.exists(db_path):
+                    conn = sqlite3.connect(db_path)
+                    try:
+                        cursor = conn.cursor()
+                        month_prefix = f"{year:04d}-{month:02d}-"
+                        cursor.execute("SELECT check_in_time, attendance_status FROM attendance WHERE email = ? AND check_in_time LIKE ?", (email_val, f"{month_prefix}%"))
+                        days_absent = len({r[0][:10] for r in cursor.fetchall() if r[0] and r[1] and "absent" in str(r[1]).lower()})
+                    finally: conn.close()
+            absence_percentage = (days_absent / work_days_elapsed * 100) if work_days_elapsed > 0 else 0.0
+            punctuality_rate = ((days_present - days_late) / days_present * 100) if days_present > 0 else 0.0
+
+            if hasattr(dash_ids, 'absence_rate'):
+                dash_ids.absence_rate.text = f"{absence_percentage:.1f}%"
+            if hasattr(dash_ids, 'total_days_present'):
+                dash_ids.total_days_present.text = f"{days_present} Days"
+            if hasattr(dash_ids, 'total_days_absent'):
+                dash_ids.total_days_absent.text = f"{days_absent} Days"
+            if hasattr(dash_ids, 'card_present_count'):
+                dash_ids.card_present_count.text = f"{days_present} Days"
+            if hasattr(dash_ids, 'card_absent_count'):
+                dash_ids.card_absent_count.text = f"{days_absent} Days"
+            if hasattr(dash_ids, 'card_punctuality_rate'):
+                dash_ids.card_punctuality_rate.text = f"{punctuality_rate:.0f}%"
+            if hasattr(dash_ids, 'card_late_count'):
+                dash_ids.card_late_count.text = f"{days_late} Times"
+
+        except Exception:
+            logger.exception("Error calculating dashboard metrics:")
+
+    # -----------------------------
+    # Attendance Working-Day Rules
+    # -----------------------------
+    # Sections allowed to capture attendance every day of the week.
+    # All other sections retain the existing Monday-Thursday rule.
+    WEEKEND_ATTENDANCE_SECTIONS = {
+        "INFORMATION MANAGEMENT",
+        "HR",
+        "SECURITY",
+    }
+
+    def _staff_can_attend_weekends(self):
+        """Return True when Information Management or Security staff may attend Fri-Sun."""
+        try:
+            section = str(self.current_user[16] if self.current_user and len(self.current_user) > 16 else "").strip().upper()
+            # Accept both separate sections ("INFORMATION MANAGEMENT", "SECURITY")
+            # and combined labels such as "INFORMATION MANAGEMENT AND SECURITY".
+            return ("INFORMATION MANAGEMENT" in section or "SECURITY" in section or section == "HR")
+        except Exception:
+            return False
+
+    def _is_attendance_working_day(self, date_obj=None):
+        """Attendance capture rules:
+        - Information Management, HR and Security: Monday-Sunday.
+        - Every other section: Monday-Thursday only.
+        Friday remains available in the timesheet for all staff.
+        """
+        date_obj = date_obj or datetime.now()
+        if self._staff_can_attend_weekends():
+            return True
+        return date_obj.weekday() in (0, 1, 2, 3)
+
+    def _block_attendance_non_working_day(self, action_name='Attendance'):
+        now = datetime.now()
+        if self._is_attendance_working_day(now):
+            return False
+        title = f"{action_name} Unavailable"
+        message = ("This section can only capture attendance Monday to Thursday.\n\n"
+                   "Information Management, HR and Security are permitted to check in and check out Friday, Saturday and Sunday.")
+        dialog = MDDialog(title=title, text=message,
+                          buttons=[MDFlatButton(text="OK", on_release=lambda x: dialog.dismiss())])
+        dialog.open()
+        logger.info("%s blocked on non-attendance day: %s", action_name, now.strftime('%A'))
+        return True
+
+    # -----------------------------
+    # Attendance Reminder Engine
+    # -----------------------------
+    def _reminder_reset_if_new_day(self, today):
+        if self._reminder_state.get("date") != today:
+            self._reminder_state = {"date": today, "checkin": set(), "checkout": set()}
+
+    def _today_attendance_row(self):
+        """Latest attendance row for the logged-in user for today, or None."""
+        try:
+            if not self.current_user or len(self.current_user) <= 20:
+                return None
+            email_val = str(self.current_user[20])
+            today_prefix = datetime.now().strftime("%Y-%m-%d")
+            db_path = os.path.join(os.path.dirname(__file__), "attendance.db")
+            if not os.path.exists(db_path):
+                return None
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT check_in_time, check_out_time FROM attendance "
+                "WHERE email = ? AND check_in_time LIKE ? ORDER BY id DESC LIMIT 1",
+                (email_val, f"{today_prefix}%"),
+            )
+            row = cursor.fetchone()
+            conn.close()
+            return row
+        except Exception:
+            logger.exception("Failed to read today's attendance for reminders:")
+            return None
+
+    def _reminder_tick(self, *args):
+        """Runs every 30s. Fires the on-time notification plus up to
+        REMINDER_REPEAT_COUNT nudges (every REMINDER_REPEAT_MINUTES) for
+        whichever of check-in/check-out is still outstanding. Automatically
+        skips Friday (WFH) and Saturday/Sunday via _is_attendance_working_day,
+        and stops nudging the moment the action is recorded."""
+        try:
+            now = datetime.now()
+            if not self.current_user:
+                return
+            if not self._load_reminders_enabled():
+                return
+            if not self._is_attendance_working_day(now):
+                return
+            self._reminder_reset_if_new_day(now.date())
+
+            row = self._today_attendance_row()
+            checked_in = bool(row and row[0])
+            checked_out = bool(row and row[1])
+
+            self._maybe_fire_reminder(
+                "checkin", now, REMINDER_CHECKIN_HOUR, REMINDER_CHECKIN_MINUTE,
+                checked_in, CHECKIN_REMINDER_OFFSETS_MINUTES
+            )
+            self._maybe_fire_reminder(
+                "checkout", now, REMINDER_CHECKOUT_HOUR, REMINDER_CHECKOUT_MINUTE,
+                checked_out, CHECKOUT_REMINDER_OFFSETS_MINUTES
+            )
+        except Exception:
+            logger.exception("Reminder tick failed:")
+
+    def _maybe_fire_reminder(self, kind, now, hour, minute, already_done, offsets_minutes):
+        if already_done:
+            return
+        base_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        fired = self._reminder_state[kind]
+        last_slot = len(offsets_minutes) - 1
+        for slot, offset in enumerate(offsets_minutes):  # 0 = on-time, 1..N = nudges
+            if slot in fired:
+                continue
+            slot_time = base_time + timedelta(minutes=offset)
+            if now >= slot_time:
+                fired.add(slot)
+                self._send_reminder_notification(kind, slot, last_slot)
+
+    @staticmethod
+    def _send_reminder_notification(kind, slot, last_slot):
+        label = "Check-In" if kind == "checkin" else "Check-Out"
+        verb = "checked in" if kind == "checkin" else "checked out"
+        if slot == 0:
+            title = f"ROHI {label} Reminder"
+            message = f"It's time to {label.lower()}. Open ROHI Attendance and tap {label}."
+        else:
+            title = f"ROHI {label} Reminder ({slot}/{last_slot})"
+            message = f"You still haven't {verb} today. Please do so now."
+        try:
+            from plyer import notification as plyer_notification
+            plyer_notification.notify(title=title, message=message, app_name="ROHI Attendance", timeout=15)
+        except Exception:
+            logger.exception("Failed to show %s reminder notification (slot %s):", kind, slot)
+        logger.info("Reminder fired: %s slot %s", kind, slot)
+
+    # -----------------------------
+    # Silent Background Auto-Sync
+    # -----------------------------
+    def _auto_sync_tick(self, *args):
+        try:
+            config = pg_sync.load_config()
+            if config.get("host"):
+                threading.Thread(target=self._auto_sync_worker, args=(config,), daemon=True).start()
+        except Exception:
+            logger.exception("Auto-sync tick failed:")
+
+        try:
+            if gform_sync.is_configured():
+                threading.Thread(target=self._gform_auto_sync_worker, daemon=True).start()
+        except Exception:
+            logger.exception("Google Form auto-sync tick failed:")
+
+    def _auto_sync_worker(self, config):
+        try:
+            if not pg_sync.is_connected():
+                # Establishes the persistent connection (used by the
+                # Settings "Connected"/"Not connected" status and by
+                # Synchronize Now), not just a one-off sync - otherwise the
+                # status label stays stuck on "Not connected" forever even
+                # though data is quietly syncing fine in the background.
+                ok, message = pg_sync.connect(config, auto_sync=True)
+                logger.info("Auto-connect: ok=%s message=%s", ok, message)
+            else:
+                ok, message, counts = pg_sync.synchronize_now(config)
+                logger.info("Auto-sync: ok=%s message=%s counts=%s", ok, message, counts)
+            Clock.schedule_once(lambda dt: self._refresh_connection_status_labels(), 0)
+        except Exception:
+            logger.exception("Background auto-sync failed:")
+
+    @staticmethod
+    def _gform_auto_sync_worker():
+        """Pushes every completed (checked-out) attendance row that hasn't
+        reached the Google Form yet. Runs on the shared AUTO_SYNC_INTERVAL_SECONDS
+        timer, and is also kicked off immediately after a check-out so today's
+        row shows up in the Sheet right away instead of waiting for the timer."""
+        try:
+            config = gform_sync.load_config()
+            rows = get_pending_gform_attendance()
+            for row in rows:
+                (att_id, email, check_in_time, check_out_time, gps_in, gps_out,
+                 current_state_office, fullname, staff_number, department, section, position) = row
+                date_str = (check_in_time or check_out_time or "")[:10]
+                payload = {
+                    "name": fullname or email or "",
+                    "staff_id": staff_number or "",
+                    "department": department or "",
+                    "section": section or "",
+                    "position": position or "",
+                    "date": date_str,
+                    "checkin": check_in_time or "",
+                    "checkout": check_out_time or "",
+                    "gps": gps_out or gps_in or "",
+                    "current_state_office": current_state_office or "",
+                }
+                ok, message = gform_sync.submit_row(payload, config=config)
+                if ok:
+                    mark_gform_synced(att_id)
+                    logger.info("Google Form sync: row id=%s submitted.", att_id)
+                else:
+                    logger.warning("Google Form sync: row id=%s failed: %s", att_id, message)
+                    # Stop on first failure (likely offline) - the next timer
+                    # tick will retry this and any later rows in order.
+                    break
+        except Exception:
+            logger.exception("Google Form background sync failed:")
+
+    # -----------------------------
+    # Assigned Check In & Check Out Actions
+    # -----------------------------
+    def _show_gps_failure(self, message):
+        try:
+            dash_ids = self.dashboard_screen.ids
+            if hasattr(dash_ids, 'geofence_note_label'):
+                dash_ids.geofence_note_label.text = message
+                dash_ids.geofence_note_label.text_color = (0.8, 0.1, 0.1, 1)
+            if hasattr(dash_ids, 'checkout_geofence_note_label'):
+                dash_ids.checkout_geofence_note_label.text = message
+                dash_ids.checkout_geofence_note_label.text_color = (0.8, 0.1, 0.1, 1)
+        except Exception:
+            logger.exception("Could not display GPS failure message:")
+
+    def check_in(self):
+        """Captures a fresh GPS fix and validates it against the staff member's
+        registered office coordinate before completing Check-In (geofencing)."""
+        if self._block_attendance_non_working_day("Check-In"):
+            return
+        logger.info("Check-In action triggered; capturing GPS for geofence validation...")
+        dash_ids = self.dashboard_screen.ids
+        if self.checked_in:
+            logger.info("User is already checked in and static lock is active.")
+            if hasattr(dash_ids, 'geofence_note_label'):
+                dash_ids.geofence_note_label.text = "✅ Already checked in today."
+                dash_ids.geofence_note_label.text_color = (0.13, 0.40, 0.16, 1)
+            return
+        if not self.current_user:
+            logger.warning("Check-In blocked: no authenticated user in session.")
+            return
+
+        # Immediate feedback so the (up to a few seconds) GPS wait doesn't look frozen.
+        if hasattr(dash_ids, 'check_in_btn'):
+            dash_ids.check_in_btn.disabled = True
+        if hasattr(dash_ids, 'geofence_note_label'):
+            dash_ids.geofence_note_label.text = "📍 Capturing current GPS location..."
+            dash_ids.geofence_note_label.text_color = (0.4, 0.4, 0.4, 1)
+        if hasattr(dash_ids, 'geofence_icon'):
+            dash_ids.geofence_icon.icon = "crosshairs-gps"
+            dash_ids.geofence_icon.text_color = (0.4, 0.4, 0.4, 1)
+
+        self._checkin_pending = True
+        self._checkin_gps_fix = None
+        self.current_location = ""
+        # Always obtain a fresh phone GPS fix. The office coordinate is only
+        # the fixed geofence target; it is never substituted for the phone's
+        # current coordinate.
+        if not self._ensure_location_permission():
+            return
+        self._start_live_checkin_gps()
+
+    def _on_checkin_gps(self, **kwargs):
+        # NOTE: on Android this callback fires on plyer's location-listener
+        # thread, not the Kivy UI thread. @mainthread schedules the actual
+        # work for the next UI frame so widget updates are safe and reliable
+        # (previously this ran inline and could silently fail to update the
+        # dashboard, or intermittently drop the GPS fix, on real devices).
+        lat = kwargs.get("lat")
+        lon = kwargs.get("lon")
+        self._handle_checkin_gps(lat, lon)
+
+    @mainthread
+    def _handle_checkin_gps(self, lat, lon):
+        if not self._checkin_pending:
+            return
+        if lat is not None and lon is not None:
+            self._checkin_gps_fix = (float(lat), float(lon))
+            self.current_location = f"{float(lat):.6f}° N, {float(lon):.6f}° E"
+            self._last_checkin_gps = self.current_location
+            logger.info(f"Check-In fresh Plyer GPS captured: {self.current_location}")
+            self._cancel_gps_timeout()
+            try:
+                gps.stop()
+            except Exception:
+                pass
+            self._finalize_check_in()
+
+    def _checkin_gps_timeout(self, dt):
+        self._gps_timeout_event = None
+        if self._checkin_pending:
+            logger.warning("GPS fix timed out during check-in; denying because no fresh phone coordinate was captured.")
+            try:
+                gps.stop()
+            except Exception:
+                pass
+            self._stop_android_location_updates()
+            self._checkin_pending = False
+            self._show_gps_failure("Check-In denied: no fresh phone GPS fix was received within 30 seconds. Confirm Android Location is ON and Precise Location is allowed for ROHI, then press CHECK IN again.")
+            try:
+                self.dashboard_screen.ids.check_in_btn.disabled = False
+            except Exception:
+                pass
+
+    def _finalize_check_in(self):
+        """Validates the geofence against the freshly captured GPS, then completes
+        Check-In only if the staff member is within office range."""
+        if not self._checkin_pending:
+            return
+        self._checkin_pending = False
+
+        dash_ids = self.dashboard_screen.ids
+        try:
+            if self.checked_in:
+                return
+
+            now = datetime.now()
+            if not self._checkin_gps_fix or not self.current_location:
+                if hasattr(dash_ids, 'current_gps_label'):
+                    dash_ids.current_gps_label.text = "GPS unavailable"
+                if hasattr(dash_ids, 'geofence_note_label'):
+                    dash_ids.geofence_note_label.text = "GPS unavailable - Check-In Denied"
+                return
+            within_range, distance = self._check_geofence(self.current_location)
+
+            if hasattr(dash_ids, 'current_gps_label'):
+                dash_ids.current_gps_label.text = self.current_location
+
+            if not within_range:
+                note = (f"Not Within Office Range ({distance:.0f} m away) - Check-In Denied"
+                        if distance is not None else "Location Unavailable - Check-In Denied")
+                if hasattr(dash_ids, 'geofence_note_label'):
+                    dash_ids.geofence_note_label.text = note
+                    dash_ids.geofence_note_label.text_color = (0.8, 0.1, 0.1, 1)
+                if hasattr(dash_ids, 'geofence_icon'):
+                    dash_ids.geofence_icon.icon = "map-marker-alert"
+                    dash_ids.geofence_icon.text_color = (0.8, 0.1, 0.1, 1)
+                if hasattr(dash_ids, 'geofence_status_card'):
+                    dash_ids.geofence_status_card.md_bg_color = (0.97, 0.88, 0.88, 1)
+
+                distance_text = f"You are currently about {distance:.0f} m away." if distance is not None else "Your location could not be verified."
+                dialog = MDDialog(
+                    title="Check-In Denied",
+                    text=f"You must be within {self.GEOFENCE_RADIUS_METERS} m of the registered office GPS coordinate to check in. {distance_text}",
+                    buttons=[MDFlatButton(text="OK", on_release=lambda x: dialog.dismiss())]
+                )
+                dialog.open()
+                logger.warning(f"Check-in rejected: outside geofence (distance={distance}).")
+                return
+
+            # Within range -> proceed with Check-In
+            self.checked_in = True
+            self.check_in_datetime = now
+            self.check_out_datetime = None
+
+            # Punctuality & Late Hours Calculation (Target: 8:00 AM)
+            work_start_time = now.replace(hour=8, minute=0, second=0, microsecond=0)
+            if now > work_start_time:
+                diff = now - work_start_time
+                hours, remainder = divmod(diff.seconds, 3600)
+                minutes = remainder // 60
+                self.late_duration_str = f"{hours}h {minutes}m" if hours else f"{minutes}m"
+                status_str = "Present but Late"
+                text_color = (0.9, 0.5, 0, 1)  # Yellow
+            else:
+                self.late_duration_str = "On Time"
+                status_str = "Present (On Time)"
+                text_color = (0.1, 0.6, 0.2, 1)  # Green
+
+            if hasattr(dash_ids, 'clock_in_time_label'):
+                dash_ids.clock_in_time_label.text = now.strftime('%I:%M %p')
+            if hasattr(dash_ids, 'clock_out_time_label'):
+                dash_ids.clock_out_time_label.text = "Pending"
+            if hasattr(dash_ids, 'punctuality_status'):
+                dash_ids.punctuality_status.text = status_str
+                dash_ids.punctuality_status.text_color = text_color
+            if hasattr(dash_ids, 'hours_late_label'):
+                dash_ids.hours_late_label.text = (
+                    "Late by: 0m (On Time)" if self.late_duration_str == "On Time"
+                    else f"Late by: {self.late_duration_str}"
+                )
+            if hasattr(dash_ids, 'trend_today_status'):
+                dash_ids.trend_today_status.text = "⚠ Late" if status_str == "Present but Late" else "✓ On"
+                dash_ids.trend_today_status.text_color = text_color
+
+            note = f"Captured Within Office ({distance:.0f} m)" if distance is not None else "Captured Within Office"
+            if hasattr(dash_ids, 'geofence_note_label'):
+                dash_ids.geofence_note_label.text = note
+                dash_ids.geofence_note_label.text_color = (0.1, 0.5, 0.15, 1)
+            if hasattr(dash_ids, 'geofence_icon'):
+                dash_ids.geofence_icon.icon = "map-marker-check"
+                dash_ids.geofence_icon.text_color = (0.1, 0.6, 0.2, 1)
+            if hasattr(dash_ids, 'geofence_status_card'):
+                dash_ids.geofence_status_card.md_bg_color = (0.88, 0.95, 0.88, 1)
+
+            self._last_current_state_office, _ = self._nearest_configured_office(self.current_location)
+
+            # Save attendance log to database with exact day-to-day exact time-in and time-out log support
+            email_val = str(self.current_user[20]) if self.current_user and len(self.current_user) > 20 else "user@rohi.org"
+            db_path = os.path.join(os.path.dirname(__file__), "attendance.db")
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO attendance (email, check_in_time, check_out_time, late_duration, attendance_status, gps_location, current_state_office, synced)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+            ''', (email_val, now.strftime("%Y-%m-%d %H:%M:%S"), "", self.late_duration_str, status_str, self.current_location, getattr(self, "_last_current_state_office", "") or ""))
+            conn.commit()
+            conn.close()
+
+            # Kobo-style immediate submission: send the attendance row as data
+            # to the configured endpoint, without opening Google or generating
+            # an Excel file for every check-in.
+            threading.Thread(
+                target=self._submit_attendance_to_endpoint,
+                kwargs={"check_in": now.strftime("%Y-%m-%d %H:%M:%S"),
+                        "checkin_gps": self.current_location},
+                daemon=True,
+            ).start()
+
+            self.update_dashboard_metrics()
+            logger.info("Staff successfully checked in.")
+        except Exception:
+            logger.exception("Error executing check_in:")
+        finally:
+            if hasattr(dash_ids, 'check_in_btn'):
+                dash_ids.check_in_btn.disabled = self.checked_in
+            # Check-Out only becomes usable once Check-In has actually succeeded.
+            if hasattr(dash_ids, 'check_out_btn'):
+                dash_ids.check_out_btn.disabled = not self.checked_in
+
+    def _ensure_checkout_location_permission(self):
+        """Ensure Android location permission is available before Check-Out GPS capture."""
+        if platform != "android":
+            return True
+
+        try:
+            from android.permissions import check_permission, request_permissions, Permission
+            fine = bool(check_permission(Permission.ACCESS_FINE_LOCATION))
+            coarse = bool(check_permission(Permission.ACCESS_COARSE_LOCATION))
+            if fine or coarse:
+                return True
+            self._checkout_pending = True
+            logger.info("Requesting Android location permission for Check-Out.")
+            request_permissions(
+                [Permission.ACCESS_FINE_LOCATION, Permission.ACCESS_COARSE_LOCATION],
+                self._on_checkout_location_permission_result,
+            )
+            return False
+        except Exception:
+            logger.exception("Android Check-Out location permission check/request failed.")
+            self._checkout_pending = False
+            self._show_gps_failure(
+                "Location permission could not be requested. Open Android Settings > Apps > ROHI IMS > Permissions > Location and allow Precise Location, then try Check-Out again."
+            )
+            try:
+                self.dashboard_screen.ids.check_out_btn.disabled = False
+            except Exception:
+                pass
+            return False
+
+    @mainthread
+    def _on_checkout_location_permission_result(self, permissions, grants):
+        try:
+            granted = any(bool(g) for g in grants)
+        except Exception:
+            granted = False
+        if granted and self._checkout_pending:
+            self._start_live_checkout_gps()
+        elif self._checkout_pending:
+            self._checkout_pending = False
+            self._show_gps_failure(
+                "Location permission is required. Allow Precise Location for ROHI IMS, then press Check-Out again."
+            )
+            try:
+                self.dashboard_screen.ids.check_out_btn.disabled = False
+            except Exception:
+                pass
+
+    def _start_android_checkout_location_polling(self):
+        """Poll Android last-known location as a reliability fallback for Check-Out.
+
+        The live LocationListener callback alone can fail to fire on some
+        devices/ROMs (e.g. MIUI on Redmi phones aggressively throttles apps
+        in the background/foreground-service state, delaying or dropping
+        onLocationChanged callbacks) even though the GPS/network provider
+        already has a fresh fix internally.
+
+        This mirrors the Check-In polling fallback, but adds a strict
+        freshness gate: a candidate fix is only accepted if its provider
+        timestamp is from AFTER this Check-Out request started. That
+        preserves the original guarantee that Check-Out can never silently
+        reuse the stale Check-In coordinate (or any older cached fix) — it
+        only accepts a coordinate the device generated *during* this
+        Check-Out attempt.
+        """
+        if platform != "android":
+            return
+        try:
+            from jnius import autoclass
+            Context = autoclass("android.content.Context")
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            manager = PythonActivity.mActivity.getSystemService(Context.LOCATION_SERVICE)
+            LocationManager = autoclass("android.location.LocationManager")
+            providers = []
+            for provider in (LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER):
+                try:
+                    if manager.isProviderEnabled(provider):
+                        providers.append(provider)
+                except Exception:
+                    pass
+            if not providers:
+                return
+
+            old_stop = self._checkout_gps_poll_stop
+            if old_stop is not None:
+                try:
+                    old_stop.set()
+                except Exception:
+                    pass
+            stop_event = threading.Event()
+            self._checkout_gps_poll_stop = stop_event
+
+            started_ms = int(getattr(self, "_checkout_location_request_started_ms", 0) or 0)
+
+            def worker():
+                deadline = time.time() + 32
+                last_signature = None
+                while not stop_event.is_set() and time.time() < deadline and self._checkout_pending:
+                    best = None
+                    for provider in providers:
+                        try:
+                            loc = manager.getLastKnownLocation(provider)
+                            if loc is None:
+                                continue
+                            loc_time = int(loc.getTime())
+                            # Strict freshness gate: reject anything not stamped
+                            # after this Check-Out request began (a 1.5s grace
+                            # window covers clock/scheduling jitter). This is
+                            # what keeps the "never reuse Check-In GPS" promise
+                            # intact while still using getLastKnownLocation as
+                            # a reliability net.
+                            if not loc_time or loc_time < started_ms - 1500:
+                                continue
+                            lat = float(loc.getLatitude())
+                            lon = float(loc.getLongitude())
+                            accuracy = float(loc.getAccuracy()) if loc.hasAccuracy() else 9999.0
+                            age_s = max(0.0, (int(time.time() * 1000) - loc_time) / 1000.0)
+                            if accuracy <= 150.0:
+                                candidate = (accuracy, age_s, lat, lon)
+                                if best is None or candidate[:2] < best[:2]:
+                                    best = candidate
+                        except Exception:
+                            continue
+                    if best is not None:
+                        accuracy, age_s, lat, lon = best
+                        signature = (round(lat, 6), round(lon, 6), round(accuracy, 1))
+                        if signature != last_signature:
+                            last_signature = signature
+                            logger.info(
+                                "Android Check-Out GPS poll fix: %.7f, %.7f accuracy=%.1fm age=%.1fs",
+                                lat, lon, accuracy, age_s
+                            )
+                            Clock.schedule_once(
+                                lambda dt, la=lat, lo=lon, ac=accuracy: self._on_android_checkout_location(la, lo, ac),
+                                0
+                            )
+                            return
+                    time.sleep(1.0)
+
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception:
+            logger.exception("Android Check-Out GPS polling fallback failed")
+
+    def _start_android_checkout_location_fallback(self):
+        """Request a real Android LocationManager fix for Check-Out."""
+        from jnius import autoclass, PythonJavaClass, java_method
+        LocationManager = autoclass('android.location.LocationManager')
+        Looper = autoclass('android.os.Looper')
+        Context = autoclass('android.content.Context')
+
+        app_context = None
+        try:
+            app_context = self._get_android_activity()
+        except Exception:
+            try:
+                app_context = self._android_context
+            except Exception:
+                pass
+        if app_context is None:
+            raise RuntimeError("Android activity context unavailable")
+
+        manager = app_context.getSystemService(Context.LOCATION_SERVICE)
+        if manager is None:
+            raise RuntimeError("Android LocationManager unavailable")
+
+        outer = self
+
+        class CheckoutLocationListener(PythonJavaClass):
+            __javainterfaces__ = ['android/location/LocationListener']
+            __javacontext__ = 'app'
+
+            @java_method('(Landroid/location/Location;)V')
+            def onLocationChanged(self, location):
+                try:
+                    if location is not None:
+                        location_time = int(location.getTime()) if location.getTime() else 0
+                        started_ms = int(getattr(outer, "_checkout_location_request_started_ms", 0) or 0)
+                        if started_ms and location_time and location_time < started_ms - 1500:
+                            logger.info("Ignoring stale Android Check-Out location: age=%sms", started_ms - location_time)
+                            return
+                        lat = float(location.getLatitude())
+                        lon = float(location.getLongitude())
+                        accuracy = float(location.getAccuracy()) if location.hasAccuracy() else None
+                        logger.info(
+                            "Android Check-Out LocationManager fix: %.7f, %.7f accuracy=%s",
+                            lat, lon, accuracy
+                        )
+                        outer._on_android_checkout_location(lat, lon, accuracy)
+                except Exception:
+                    logger.exception("Android Check-Out location callback failed")
+
+            @java_method('(Ljava/lang/String;I)V')
+            def onStatusChanged(self, provider, status):
+                pass
+
+            @java_method('(Ljava/lang/String;)V')
+            def onProviderEnabled(self, provider):
+                logger.info("Android Check-Out location provider enabled: %s", provider)
+
+            @java_method('(Ljava/lang/String;)V')
+            def onProviderDisabled(self, provider):
+                logger.warning("Android Check-Out location provider disabled: %s", provider)
+
+        listener = CheckoutLocationListener()
+        self._android_location_listener = listener
+
+        providers = []
+        for provider in (LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER):
+            try:
+                if manager.isProviderEnabled(provider):
+                    providers.append(provider)
+            except Exception:
+                pass
+        if not providers:
+            raise RuntimeError("No Android location provider is enabled")
+
+        # IMPORTANT: never use Android's last-known location for Check-Out.
+        # It can be the exact Check-In coordinate even after the phone moved.
+        # Only a LocationManager callback received after this request starts is
+        # accepted as the Check-Out GPS.
+        self._checkout_location_request_started_ms = int(time.time() * 1000)
+        requested = False
+        for provider in providers:
+            try:
+                manager.requestLocationUpdates(provider, 1000, 0.0, listener, Looper.getMainLooper())
+                requested = True
+                logger.info("Android live Check-Out location updates requested from %s", provider)
+            except Exception:
+                logger.exception("Could not request live Android Check-Out updates from %s", provider)
+
+        if not requested:
+            raise RuntimeError("Android could not register any live Check-Out location provider")
+
+    @mainthread
+    def _on_android_checkout_location(self, lat, lon, accuracy=None):
+        if not self._checkout_pending:
+            return
+        if accuracy is not None and accuracy > 150:
+            logger.warning("Ignoring inaccurate Android Check-Out location: accuracy=%.1fm", accuracy)
+            return
+        self._checkout_gps_fix = (float(lat), float(lon))
+        self.current_location = f"{float(lat):.6f}° N, {float(lon):.6f}° E"
+        logger.info("Fresh Android GPS accepted for Check-Out: %s accuracy=%s", self.current_location, accuracy)
+        self._cancel_gps_timeout()
+        try:
+            gps.stop()
+        except Exception:
+            pass
+        self._stop_android_location_updates()
+        self._finalize_check_out()
+
+    def _start_live_checkout_gps(self):
+        """Capture a genuinely new Check-Out GPS fix; never reuse Check-In GPS."""
+        self._cancel_gps_timeout()
+        self._checkout_location_request_started_ms = int(time.time() * 1000)
+
+        if platform == "android":
+            try:
+                self._start_android_checkout_location_fallback()
+                self._start_android_checkout_location_polling()
+                self._gps_timeout_event = Clock.schedule_once(self._checkout_gps_timeout, 45)
+                return
+            except Exception:
+                logger.exception("Android live Check-Out GPS failed; trying Plyer fallback.")
+
+        try:
+            gps.configure(on_location=self._on_checkout_gps, on_status=self.gps_status)
+            gps.start(minTime=500, minDistance=0)
+            self._gps_timeout_event = Clock.schedule_once(self._checkout_gps_timeout, 45)
+            logger.info("Plyer GPS started for Check-Out fallback.")
+        except Exception:
+            logger.exception("Plyer GPS start failed for Check-Out.")
+            self._checkout_pending = False
+            self._show_gps_failure(
+                "GPS could not be started. Turn ON Location/GPS and allow ROHI IMS to use location, then try Check-Out again."
+            )
+            try:
+                self.dashboard_screen.ids.check_out_btn.disabled = False
+            except Exception:
+                pass
+
+    def check_out(self):
+        """Captures a fresh GPS fix at the moment Check-Out is pressed, and
+        evaluates it against the registered office coordinate (informational -
+        unlike Check-In, Check-Out is not blocked by geofencing, only labeled)."""
+        if self._block_attendance_non_working_day("Check-Out"):
+            return
+        logger.info("Check-Out action triggered; capturing GPS...")
+        dash_ids = self.dashboard_screen.ids
+        if not self.checked_in:
+            logger.info("User is not checked in yet.")
+            if hasattr(dash_ids, 'checkout_geofence_note_label'):
+                dash_ids.checkout_geofence_note_label.text = "⚠️ You need to Check In first."
+                dash_ids.checkout_geofence_note_label.text_color = (0.8, 0.1, 0.1, 1)
+            return
+        if self.check_out_datetime:
+            logger.info("User already checked out; static lock is active.")
+            if hasattr(dash_ids, 'checkout_geofence_note_label'):
+                dash_ids.checkout_geofence_note_label.text = "✅ Already checked out today."
+                dash_ids.checkout_geofence_note_label.text_color = (0.13, 0.40, 0.16, 1)
+            return
+
+        if hasattr(dash_ids, 'check_out_btn'):
+            dash_ids.check_out_btn.disabled = True
+        if hasattr(dash_ids, 'checkout_geofence_note_label'):
+            dash_ids.checkout_geofence_note_label.text = "📍 Capturing current GPS location..."
+            dash_ids.checkout_geofence_note_label.text_color = (0.4, 0.4, 0.4, 1)
+        if hasattr(dash_ids, 'checkout_geofence_icon'):
+            dash_ids.checkout_geofence_icon.icon = "crosshairs-gps"
+            dash_ids.checkout_geofence_icon.text_color = (0.4, 0.4, 0.4, 1)
+
+        self._checkout_pending = True
+        self._checkout_gps_fix = None
+        self._android_location_listener = None
+        self._gps_poll_stop = None
+        self._checkout_gps_poll_stop = None
+        self._gps_timeout_event = None
+        self.current_location = ""
+
+        # Use the same permission + multi-provider GPS strategy as Check-In.
+        # The previous Check-Out path only started Plyer GPS, which could time
+        # out on some Android devices even though Check-In had already obtained a fix.
+        if not self._ensure_checkout_location_permission():
+            return
+        self._start_live_checkout_gps()
+
+    def _on_checkout_gps(self, **kwargs):
+        # See _on_checkin_gps: marshal off the plyer callback thread and
+        # onto the Kivy UI thread before touching any widgets or finalizing.
+        lat = kwargs.get("lat")
+        lon = kwargs.get("lon")
+        self._handle_checkout_gps(lat, lon)
+
+    @mainthread
+    def _handle_checkout_gps(self, lat, lon):
+        if lat is not None and lon is not None:
+            self._checkout_gps_fix = (float(lat), float(lon))
+            self.current_location = f"{float(lat):.6f}° N, {float(lon):.6f}° E"
+            logger.info(f"Check-Out fresh GPS captured: {self.current_location}")
+            try:
+                gps.stop()
+            except Exception:
+                pass
+            self._finalize_check_out()
+
+    def _checkout_gps_timeout(self, dt):
+        if getattr(self, '_checkout_pending', False):
+            logger.warning("GPS fix timed out during check-out; no fresh phone coordinate available.")
+            try:
+                gps.stop()
+            except Exception:
+                pass
+            self._stop_android_location_updates()
+            self._checkout_pending = False
+            self._show_gps_failure(
+                "Check-Out denied: the phone could not obtain a fresh GPS coordinate. "
+                "Enable Location (High accuracy mode), then try again. On MIUI/Redmi phones, "
+                "also allow ROHI IMS to 'Autostart' and remove it from battery restrictions "
+                "in Settings > Apps > ROHI IMS, so location updates aren't blocked in the background."
+            )
+
+    def _finalize_check_out(self):
+        """Completes Check-Out using the freshly captured GPS: records the exact
+        time + coordinate, and shows Within/Not Within Office status (informational)."""
+        if not getattr(self, '_checkout_pending', False):
+            return
+        self._checkout_pending = False
+
+        dash_ids = self.dashboard_screen.ids
+        try:
+            if not self.checked_in or self.check_out_datetime:
+                return
+
+            now = datetime.now()
+            if not self._checkout_gps_fix or not self.current_location:
+                return
+            checkout_gps = self.current_location
+            within_range, distance = self._check_geofence(checkout_gps)
+
+            self.check_out_datetime = now
+
+            if hasattr(dash_ids, 'clock_out_time_label'):
+                dash_ids.clock_out_time_label.text = now.strftime('%I:%M %p')
+            if hasattr(dash_ids, 'checkout_gps_label'):
+                dash_ids.checkout_gps_label.text = checkout_gps
+
+            if within_range:
+                note = f"Captured Within Office ({distance:.0f} m)" if distance is not None else "Captured Within Office"
+                color = (0.1, 0.5, 0.15, 1)
+                icon = "map-marker-check"
+                card_color = (0.88, 0.95, 0.88, 1)
+            else:
+                note = f"Not Within Office Range ({distance:.0f} m away)" if distance is not None else "Not Within Office Range"
+                color = (0.8, 0.1, 0.1, 1)
+                icon = "map-marker-alert"
+                card_color = (0.97, 0.88, 0.88, 1)
+
+            if hasattr(dash_ids, 'checkout_geofence_note_label'):
+                dash_ids.checkout_geofence_note_label.text = note
+                dash_ids.checkout_geofence_note_label.text_color = color
+            if hasattr(dash_ids, 'checkout_geofence_icon'):
+                dash_ids.checkout_geofence_icon.icon = icon
+                dash_ids.checkout_geofence_icon.text_color = color
+            if hasattr(dash_ids, 'checkout_geofence_status_card'):
+                dash_ids.checkout_geofence_status_card.md_bg_color = card_color
+
+            # Update database record with exact check_out_time AND the GPS
+            # coordinate captured at that moment, for monthly report maintenance.
+            email_val = str(self.current_user[20]) if self.current_user and len(self.current_user) > 20 else "user@rohi.org"
+            db_path = os.path.join(os.path.dirname(__file__), "attendance.db")
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+
+            # Scope strictly to TODAY's check-in row (matching on the exact
+            # check_in_datetime we hold in memory). Previously this matched
+            # ANY row for this email with an empty check_out_time, which could
+            # silently stamp the checkout onto a stale old row instead of
+            # today's, making today's checkout look like it never happened.
+            today_prefix = now.strftime("%Y-%m-%d")
+            self._last_current_state_office, _ = self._nearest_configured_office(checkout_gps)
+            cursor.execute('''
+                UPDATE attendance SET check_out_time = ?, check_out_gps_location = ?, current_state_office = COALESCE(NULLIF(?, ''), current_state_office), synced = 0
+                WHERE email = ? AND check_in_time = ?
+            ''', (now.strftime("%Y-%m-%d %H:%M:%S"), checkout_gps, getattr(self, "_last_current_state_office", "") or "", email_val,
+                  self.check_in_datetime.strftime("%Y-%m-%d %H:%M:%S")))
+
+            if cursor.rowcount == 0:
+                # Fallback: match today's most recent still-open row for this email.
+                cursor.execute('''
+                    UPDATE attendance SET check_out_time = ?, check_out_gps_location = ?, current_state_office = COALESCE(NULLIF(?, ''), current_state_office), synced = 0
+                    WHERE id = (
+                        SELECT id FROM attendance
+                        WHERE email = ? AND check_in_time LIKE ?
+                        AND (check_out_time IS NULL OR check_out_time = '')
+                        ORDER BY id DESC LIMIT 1
+                    )
+                ''', (now.strftime("%Y-%m-%d %H:%M:%S"), checkout_gps, getattr(self, "_last_current_state_office", "") or "", email_val, f"{today_prefix}%"))
+
+            conn.commit()
+            conn.close()
+
+            # Submit the completed row immediately to the Attendance endpoint.
+            threading.Thread(
+                target=self._submit_attendance_to_endpoint,
+                kwargs={"check_in": self.check_in_datetime.strftime("%Y-%m-%d %H:%M:%S") if self.check_in_datetime else "",
+                        "check_out": now.strftime("%Y-%m-%d %H:%M:%S"),
+                        "checkin_gps": getattr(self, "_last_checkin_gps", "") or "",
+                        "checkout_gps": checkout_gps},
+                daemon=True,
+            ).start()
+
+            self.update_dashboard_metrics()
+            logger.info("Staff successfully checked out. Session stays static until the 6:00 PM reset.")
+
+            # Fire an immediate Google Form push for today's now-complete row,
+            # instead of waiting for the next 5-minute auto-sync tick.
+            try:
+                if gform_sync.is_configured():
+                    threading.Thread(target=self._gform_auto_sync_worker, daemon=True).start()
+            except Exception:
+                logger.exception("Failed to kick off immediate Google Form sync after check-out:")
+        except Exception:
+            logger.exception("Error executing check_out:")
+        finally:
+            if hasattr(dash_ids, 'check_out_btn'):
+                dash_ids.check_out_btn.disabled = bool(self.check_out_datetime)
+
+    # -----------------------------
+    # Dropdown & Picker Handlers
+    # -----------------------------
+    def open_sex_menu(self):
+        self._dismiss_active_menu()
+        options = ["Male", "Female"]
+        items = [
+            {"text": opt, "viewclass": "OneLineListItem", "on_release": lambda x=opt: self._set_field_text('sex', x)}
+            for opt in options
+        ]
+        self.active_menu = MDDropdownMenu(caller=self.registration_screen.ids.sex, items=items, width_mult=4)
+        self.active_menu.open()
+
+    def open_state_office_menu(self):
+        self._dismiss_active_menu()
+        items = [
+            {"text": off, "viewclass": "OneLineListItem", "on_release": lambda x=off: self._select_state_office(x)}
+            for off in STATE_OFFICES
+        ]
+        self.active_menu = MDDropdownMenu(caller=self.registration_screen.ids.state_office, items=items, width_mult=4)
+        self.active_menu.open()
+
+    def _select_state_office(self, office_name):
+        """Sets the State field AND auto-fills the (now static) GPS
+        Coordinate used for geofencing from the fixed OFFICES lookup, instead
+        of the device's live GPS. This coordinate does not change again after
+        being set here. The registration form no longer shows a raw GPS
+        Coordinate field, so the value is cached on the app and picked up by
+        submit_staff() directly."""
+        self._set_field_text('state_office', office_name)
+        office = OFFICES.get(office_name)
+        if office:
+            coord_str = f"{office['latitude']}° N, {office['longitude']}° E"
+            self._selected_office_gps_coordinate = coord_str
+            if hasattr(self.registration_screen.ids, 'gps_coordinate'):
+                self.registration_screen.ids.gps_coordinate.text = coord_str
+            logger.info(f"GPS Coordinate auto-filled from '{office_name}': {coord_str}")
+
+    def open_department_menu(self):
+        self._dismiss_active_menu()
+        departments = ["Programs", "HR & Operation", "Finance"]
+        items = [
+            {"text": dept, "viewclass": "OneLineListItem", "on_release": lambda x=dept: self._on_department_select(x)}
+            for dept in departments
+        ]
+        self.active_menu = MDDropdownMenu(caller=self.registration_screen.ids.department, items=items, width_mult=4)
+        self.active_menu.open()
+
+    def _on_department_select(self, dept_name):
+        self._set_field_text('department', dept_name)
+        if hasattr(self.registration_screen.ids, 'section'):
+            self.registration_screen.ids.section.text = ""
+
+    def open_section_menu(self):
+        self._dismiss_active_menu()
+        dept = self.registration_screen.ids.department.text if hasattr(self.registration_screen.ids, 'department') else ""
+        if dept == "Programs":
+            sectors = ["MEAL", "PROTECTION", "EDUCATION", "LIVELIHOOD", "WASH", "NUTRITION", "GBV", "COMMUNICATION", "INFORMATION MANAGEMENT"]
+        elif dept == "HR & Operation":
+            sectors = ["HR", "LOGISTIC", "MAINTENANCE", "SECURITY"]
+        elif dept == "Finance":
+            sectors = ["Finance"]
+        else:
+            sectors = ["General"]
+
+        items = [
+            {"text": sec, "viewclass": "OneLineListItem", "on_release": lambda x=sec: self._set_field_text('section', x)}
+            for sec in sectors
+        ]
+        self.active_menu = MDDropdownMenu(caller=self.registration_screen.ids.section, items=items, width_mult=4)
+        self.active_menu.open()
+
+    def open_employment_type_menu(self):
+        self._dismiss_active_menu()
+        types = ["Program Manager", "Manager", "Coordinator", "Officer", "Assistant", "Case Worker", "Intern", "Volunteer"]
+        items = [
+            {"text": emp, "viewclass": "OneLineListItem", "on_release": lambda x=emp: self._set_field_text('employment_type', x)}
+            for emp in types
+        ]
+        self.active_menu = MDDropdownMenu(caller=self.registration_screen.ids.employment_type, items=items, width_mult=4)
+        self.active_menu.open()
+
+    def open_state_origin_menu(self):
+        self._dismiss_active_menu()
+        states = [
+            "Abia State", "Adamawa State", "Akwa Ibom State", "Anambra State", "Bauchi State",
+            "Bayelsa State", "Benue State", "Borno State", "Cross River State", "Delta State",
+            "Ebonyi State", "Edo State", "Ekiti State", "Enugu State", "Gombe State",
+            "Imo State", "Jigawa State", "Kaduna State", "Kano State", "Katsina State",
+            "Kebbi State", "Kogi State", "Kwara State", "Lagos State", "Nasarawa State",
+            "Niger State", "Ogun State", "Ondo State", "Osun State", "Oyo State",
+            "Plateau State", "Rivers State", "Sokoto State", "Taraba State", "Yobe State", "Zamfara State"
+        ]
+        items = [
+            {"text": st, "viewclass": "OneLineListItem", "on_release": lambda x=st: self._set_field_text('state_origin', x)}
+            for st in states
+        ]
+        self.active_menu = MDDropdownMenu(caller=self.registration_screen.ids.state_origin, items=items, width_mult=4)
+        self.active_menu.open()
+
+    def open_marital_status_menu(self):
+        self._dismiss_active_menu()
+        statuses = ["Single", "Married", "Widow"]
+        items = [
+            {"text": status, "viewclass": "OneLineListItem", "on_release": lambda x=status: self._set_field_text('marital_status', x)}
+            for status in statuses
+        ]
+        self.active_menu = MDDropdownMenu(caller=self.registration_screen.ids.marital_status, items=items, width_mult=4)
+        self.active_menu.open()
+
+    def open_blood_group_menu(self):
+        self._dismiss_active_menu()
+        groups = ["A+", "A-", "B+", "B-", "AB+", "AB-", "O+", "O-"]
+        items = [
+            {"text": g, "viewclass": "OneLineListItem", "on_release": lambda x=g: self._set_field_text('blood_group', x)}
+            for g in groups
+        ]
+        self.active_menu = MDDropdownMenu(caller=self.registration_screen.ids.blood_group, items=items, width_mult=4)
+        self.active_menu.open()
+
+    def open_date_picker(self):
+        self._dismiss_active_menu()
+        date_dialog = MDDatePicker()
+        date_dialog.bind(on_save=self._on_date_save)
+        date_dialog.open()
+
+    def _on_date_save(self, instance, value, date_range):
+        if hasattr(self.registration_screen.ids, 'dob'):
+            self.registration_screen.ids.dob.text = str(value)
+
+    def _on_cfm_date_save(self, instance, value, date_range):
+        value = str(value)
+        ids = self.cfm_screen.ids
+        # The main Date received field is the default target. Staff can use
+        # the same picker for follow-up dates through their field handlers.
+        target = getattr(self, "_cfm_date_picker_target", "cfm_date_received")
+        if hasattr(ids, target):
+            ids[target].text = value
+        self._cfm_date_picker_target = "cfm_date_received"
+
+    def open_cfm_date_picker(self, target="cfm_date_received"):
+        self._dismiss_active_menu()
+        self._cfm_date_picker_target = target
+        picker = MDDatePicker()
+        picker.bind(on_save=self._on_cfm_date_save)
+        picker.open()
+
+    def _set_field_text(self, field_id, text):
+        if hasattr(self.registration_screen.ids, field_id):
+            self.registration_screen.ids[field_id].text = text
+        self._dismiss_active_menu()
+
+    # -----------------------------
+    # GPS Location
+    # -----------------------------
+    def gps_status(self, stype, status):
+        pass
+
+    # -----------------------------
+    # Android Gallery / Image Picker
+    # -----------------------------
+    def _open_image_gallery(self, target):
+        """Open the Android image picker without binding directly to the
+        Activity object. Plyer's file chooser is used first because it survives
+        Android activity recreation much more reliably than a raw
+        startActivityForResult callback in packaged Kivy apps."""
+        logger.info("Opening phone image picker for %s...", target)
+        self._set_gallery_status(target, "")
+        if platform != "android":
+            self._set_gallery_status(target, "Image picker is available on Android.")
+            return
+        self._gallery_target = target
+        try:
+            # On a lot of devices the *first* tap only triggers Android's
+            # storage-permission prompt in the background (no chooser
+            # visibly opens), so the picker only actually shows up on the
+            # second tap once permission is already granted. Request the
+            # permission up front and open the chooser as soon as we get an
+            # answer (granted or not - Storage Access Framework picking
+            # generally still works either way), so one tap is enough.
+            from android.permissions import request_permissions, Permission, check_permission
+            needed = [Permission.READ_EXTERNAL_STORAGE]
+            media_images = getattr(Permission, "READ_MEDIA_IMAGES", None)
+            if media_images:
+                needed.append(media_images)
+            if all(check_permission(p) for p in needed):
+                self._launch_filechooser()
+            else:
+                def _on_permission_result(permissions, grants):
+                    Clock.schedule_once(lambda dt: self._launch_filechooser(), 0)
+                request_permissions(needed, _on_permission_result)
+        except Exception:
+            # android.permissions unavailable - fall back to opening the
+            # chooser directly, same as before.
+            self._launch_filechooser()
+
+    def _launch_filechooser(self):
+        target = getattr(self, '_gallery_target', 'photo')
+        try:
+            from plyer import filechooser
+            filechooser.open_file(
+                on_selection=self._on_filechooser_selection,
+                filters=["*.png", "*.jpg", "*.jpeg", "*.webp"],
+                multiple=False,
+            )
+        except Exception as exc:
+            logger.exception("Could not open image picker:")
+            self._set_gallery_status(target, f"Could not open image picker: {exc}")
+
+    def _on_filechooser_selection(self, selection):
+        """Fallback callback used when the Android activity dispatcher does
+        not expose ``bind``. Plyer returns a list of selected local paths.
+        This is used for both registration photos and Timesheet signatures."""
+        target = getattr(self, '_gallery_target', 'photo')
+        try:
+            if not selection:
+                self._set_gallery_status(target, "No image was selected.")
+                return
+            source = selection[0] if isinstance(selection, (list, tuple)) else selection
+            if not source:
+                self._set_gallery_status(target, "No image was selected.")
+                return
+            source = str(source)
+            if source.startswith('file://'):
+                source = source[7:]
+            if target in ('dwpt_report','monthly_report'):
+                self._on_report_image_selected(source)
+                return
+            if not os.path.isfile(source):
+                raise RuntimeError("The selected image could not be accessed.")
+
+            folder = 'staff_photos' if target == 'photo' else 'staff_signatures'
+            prefix = 'photo' if target == 'photo' else 'signature'
+            folder_path = os.path.join(APP_DIR, folder)
+            os.makedirs(folder_path, exist_ok=True)
+            destination = os.path.abspath(os.path.join(
+                folder_path, f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+            ))
+
+            # Normalize the selected image to JPEG so the preview and Excel
+            # embedding work consistently regardless of the original format.
+            from PIL import Image
+            with Image.open(source) as image:
+                image = image.convert("RGB")
+                image.thumbnail((1200, 1200), Image.Resampling.LANCZOS)
+                image.save(destination, "JPEG", quality=88, optimize=True)
+
+            if target == 'photo':
+                self.photo_taken(destination)
+            else:
+                self.signature_captured(destination)
+            self._set_gallery_status(target, "")
+            logger.info("File chooser image imported successfully: %s", destination)
+        except Exception as e:
+            logger.exception("Failed to import image from file chooser:")
+            self._set_gallery_status(target, f"Could not import image: {e}")
+
+    def _set_gallery_status_original(self, target, message):
+        """Shows a gallery import error/status message on the right screen,
+        instead of failing silently with nothing visible on screen."""
+        try:
+            if target == 'photo' and hasattr(self, 'registration_screen') \
+                    and hasattr(self.registration_screen.ids, 'photo_status_label'):
+                self.registration_screen.ids.photo_status_label.text = message
+            elif target == 'signature' and hasattr(self, 'timesheet_screen') \
+                    and hasattr(self.timesheet_screen.ids, 'timesheet_status_label'):
+                self.timesheet_screen.ids.timesheet_status_label.text = message
+        except Exception:
+            logger.exception("Failed to update gallery status label:")
+
+    def _on_gallery_result(self, request_code, result_code, intent):
+        if request_code != getattr(self, '_gallery_request_code', None):
+            return
+        target = getattr(self, '_gallery_target', 'photo')
+        try:
+            from jnius import autoclass
+            if result_code != -1 or intent is None:
+                logger.info("Gallery selection cancelled.")
+                return
+            uri = intent.getData()
+            if uri is None:
+                logger.warning("Gallery returned no image URI.")
+                self._set_gallery_status(target, "No image was selected.")
+                return
+            folder = 'staff_photos' if target == 'photo' else 'staff_signatures'
+            prefix = 'photo' if target == 'photo' else 'signature'
+            folder_path = os.path.join(APP_DIR, folder)
+            os.makedirs(folder_path, exist_ok=True)
+            destination = os.path.abspath(os.path.join(
+                folder_path, f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+            ))
+
+            activity = autoclass('org.kivy.android.PythonActivity').mActivity
+            resolver = activity.getContentResolver()
+            input_stream = resolver.openInputStream(uri)
+            if input_stream is None:
+                raise RuntimeError("Unable to read the selected gallery image.")
+
+            # Decode via Android's own Bitmap decoder and re-encode to JPEG
+            # bytes, rather than manually copying the InputStream into a
+            # Python bytearray - pyjnius does not reliably copy Java's writes
+            # into a Python-side bytearray passed as a byte[] argument, which
+            # was silently producing empty/corrupt image files.
+            BitmapFactory = autoclass('android.graphics.BitmapFactory')
+            ByteArrayOutputStream = autoclass('java.io.ByteArrayOutputStream')
+            CompressFormat = autoclass('android.graphics.Bitmap$CompressFormat')
+            bitmap = BitmapFactory.decodeStream(input_stream)
+            input_stream.close()
+            if bitmap is None:
+                raise RuntimeError("The selected file could not be read as an image.")
+            # Downscale large phone photos/signatures before storing them. This
+            # keeps the app responsive and prevents huge Excel exports.
+            max_side = 1200
+            bw, bh = int(bitmap.getWidth()), int(bitmap.getHeight())
+            if max(bw, bh) > max_side:
+                scale = max_side / float(max(bw, bh))
+                Bitmap = autoclass("android.graphics.Bitmap")
+                scaled = Bitmap.createScaledBitmap(
+                    bitmap, max(1, int(bw * scale)), max(1, int(bh * scale)), True
+                )
+                if scaled is not None:
+                    bitmap = scaled
+            baos = ByteArrayOutputStream()
+            bitmap.compress(CompressFormat.JPEG, 88, baos)
+            java_bytes = baos.toByteArray()
+            with open(destination, 'wb') as output_file:
+                output_file.write(bytes(java_bytes))
+
+            if target == 'photo':
+                self.photo_taken(destination)
+            else:
+                self.signature_captured(destination)
+            self._set_gallery_status(target, "")
+            logger.info("Gallery image imported successfully: %s", destination)
+        except Exception as e:
+            logger.exception("Failed to import image from phone gallery:")
+            self._set_gallery_status(target, f"Could not import image: {e}")
+        finally:
+            try:
+                android_activity = getattr(self, '_android_activity', None)
+                if android_activity is not None:
+                    android_activity.unbind(on_activity_result=self._on_gallery_result)
+            except Exception:
+                pass
+
+    # -----------------------------
+    # Staff Registration Photo
+    # -----------------------------
+    def capture_photo(self):
+        """Select the staff profile picture from the phone gallery (bound to
+        the "Capture Photo" camera-icon button on the registration form)."""
+        self._open_image_gallery('photo')
+
+    def toggle_password_field(self, field_id, icon_button):
+        """Shows/hides the text in a password field and flips its eye icon.
+        Bound to the eye-icon buttons next to Create Password / Confirm
+        Password on the registration form."""
+        try:
+            field = getattr(self.registration_screen.ids, field_id)
+            field.password = not field.password
+            icon_button.icon = "eye-off" if field.password else "eye"
+        except Exception:
+            logger.exception("Failed to toggle password visibility for %s:", field_id)
+
+    def photo_taken(self, path):
+        if path and os.path.exists(path):
+            self.photo_path = path
+            logger.info(f"Photo imported successfully to path: {path}")
+            try:
+                if hasattr(self.registration_screen.ids, 'photo_preview'):
+                    img = self.registration_screen.ids.photo_preview
+                    img.source = path
+                    img.reload()
+            except Exception:
+                logger.exception("Failed to refresh photo preview UI:")
+
+    # -----------------------------
+    # Registration Submission
+    # -----------------------------
+    def _ensure_unique_id(self, user):
+        """Some staff accounts were registered before auto-generated Unique IDs
+        existed, so their unique_id column (index 29) is empty. This backfills
+        one at login time and persists it, so their Dashboard and Attendance
+        Report correctly show a Unique ID from now on instead of '-'."""
+        try:
+            if user and (len(user) <= 29 or not user[29]):
+                new_id = self._generate_unique_staff_id()
+                db_path = os.path.join(os.path.dirname(__file__), "attendance.db")
+                conn = sqlite3.connect(db_path)
+                cursor = conn.cursor()
+                try:
+                    cursor.execute("UPDATE staff SET unique_id = ? WHERE id = ?", (new_id, user[0]))
+                    conn.commit()
+                except sqlite3.IntegrityError:
+                    # Extremely unlikely collision - try once more with a fresh id.
+                    new_id = self._generate_unique_staff_id()
+                    cursor.execute("UPDATE staff SET unique_id = ? WHERE id = ?", (new_id, user[0]))
+                    conn.commit()
+                cursor.execute("SELECT * FROM staff WHERE id = ?", (user[0],))
+                refreshed = cursor.fetchone()
+                conn.close()
+                logger.info(f"Backfilled Unique ID {new_id} for existing staff account (id={user[0]}).")
+                return refreshed or user
+        except Exception:
+            logger.exception("Could not backfill unique_id for existing account:")
+        return user
+
+    @staticmethod
+    def _generate_unique_staff_id():
+        """Generates a short, human-readable unique staff ID, e.g. 'ROHI-260804-7F3K'.
+        Collisions are astronomically unlikely, but insert_staff() will raise
+        sqlite3.IntegrityError on the UNIQUE constraint if one ever happens,
+        and submit_staff() retries generation in that case."""
+        date_part = datetime.now().strftime("%y%m%d")
+        code_part = "".join(random.choices("ABCDEFGHJKLMNPQRSTUVWXYZ23456789", k=4))
+        return f"ROHI-{date_part}-{code_part}"
+
+    def submit_staff(self):
+        logger.info("Submitting staff registration form...")
+        try:
+            ids = self.registration_screen.ids
+
+            def get_text(field_name):
+                if hasattr(ids, field_name):
+                    return getattr(ids, field_name).text
+                return ""
+
+            edit_mode = self.current_user is not None
+            password = get_text("password").strip()
+            confirm_password = get_text("confirm_password").strip()
+
+            if password and confirm_password and password != confirm_password:
+                logger.warning("Registration failed: Passwords do not match.")
+                self._show_registration_error(
+                    "Passwords Do Not Match",
+                    "The password and confirm password fields do not match.\n\n"
+                    "Please re-enter them."
+                )
+                return
+
+            # Compulsory fields (marked with * on the form) must be filled
+            # before the record is saved.
+            missing_fields = [
+                label for field_id, label in REQUIRED_REGISTRATION_FIELDS
+                if not get_text(field_id).strip()
+            ]
+            if not edit_mode:
+                if not password:
+                    missing_fields.append("Create Password")
+                if not confirm_password:
+                    missing_fields.append("Confirm Password")
+
+            if missing_fields:
+                logger.warning("Registration rejected: missing compulsory fields: %s", ", ".join(missing_fields))
+                self._show_registration_error(
+                    "Missing Compulsory Fields",
+                    "Please fill in the following compulsory fields marked with *:\n\n"
+                    + "\n".join(f"\u2022 {f}" for f in missing_fields)
+                )
+                return
+
+            if edit_mode and not password:
+                password = self.current_user[28] if len(self.current_user) > 28 else ""
+
+            email = get_text("email").strip().lower()
+            staff_number = get_text("staff_number").strip().lower()
+
+            # Check uniqueness BEFORE opening the INSERT/UPDATE transaction.
+            # This prevents the old code from catching a UNIQUE email error and
+            # incorrectly retrying the entire INSERT, which caused the second
+            # error: "database is locked".
+            current_id = self.current_user[0] if edit_mode else None
+            if email_exists(email, exclude_id=current_id):
+                logger.warning("Registration rejected: email already exists: %s", email)
+                self._show_registration_error(
+                    "Email Already Registered",
+                    f"The email address '{email}' is already registered.\n\n"
+                    "Please use a different email address."
+                )
+                return
+
+            if staff_number and staff_number_exists(staff_number, exclude_id=current_id):
+                logger.warning("Registration rejected: staff number already exists: %s", staff_number)
+                self._show_registration_error(
+                    "Staff Number Already Registered",
+                    f"The staff number '{staff_number}' is already registered.\n\n"
+                    "Please check the staff number and try again."
+                )
+                return
+
+            staff_data = {
+                "fullname": get_text("fullname"),
+                "sex": get_text("sex"),
+                "dob": get_text("dob"),
+                "blood_group": get_text("blood_group"),
+                "marital_status": get_text("marital_status"),
+                "nationality": get_text("nationality"),
+                "state_origin": get_text("state_origin"),
+                "lga": get_text("lga"),
+                "address": get_text("address"),
+                "next_of_kin": get_text("next_of_kin"),
+                "next_of_kin_phone": get_text("next_of_kin_phone"),
+                "employment_type": get_text("employment_type"),
+                "state_office": get_text("state_office"),
+                "cluster": get_text("cluster"),
+                "department": get_text("department"),
+                "section": get_text("section"),
+                "position": get_text("position"),
+                "staff_number": staff_number,
+                "phone": get_text("phone"),
+                "email": email,
+                "facebook": get_text("facebook"),
+                "twitter": get_text("twitter"),
+                "instagram": get_text("instagram"),
+                "telegram": get_text("telegram"),
+                "linkedin": get_text("linkedin"),
+                "gps_coordinate": (getattr(self, "_selected_office_gps_coordinate", "")
+                                    or get_text("gps_coordinate") or self.current_location),
+                "photo": getattr(self, "photo_path", ""),
+                "password": password,
+                "genotype": get_text("genotype"),
+                "reintegration_status": get_text("reintegration_status"),
+            }
+
+            if edit_mode:
+                staff_id = self.current_user[0]
+                update_staff(staff_id, staff_data)
+                logger.info(
+                    "Staff '%s' (id=%s) updated in SQLite database.",
+                    staff_data["fullname"], staff_id
+                )
+
+                self.current_user = get_staff_by_id(staff_id)
+                self._save_login_session(str(self.current_user[20]) if len(self.current_user) > 20 else email)
+                self._submit_staff_registration_immediately(staff_data)
+                email_val = self._populate_dashboard_from_current_user()
+                if email_val:
+                    self.verify_existing_checkin(email_val)
+                self.update_dashboard_metrics()
+
+                def redirect_to_dashboard(inst):
+                    dialog.dismiss()
+                    self.root.current = "dashboard"
+
+                dialog = MDDialog(
+                    title="Profile Updated",
+                    text="Your staff profile was updated successfully.",
+                    buttons=[MDFlatButton(text="OK", on_release=redirect_to_dashboard)]
+                )
+                dialog.open()
+
+            else:
+                new_unique_id = self._generate_unique_staff_id()
+                staff_data["unique_id"] = new_unique_id
+
+                # Only one staff registration is kept per phone. open_registration()
+                # already blocks starting a new registration when one exists, but
+                # this is a defensive safeguard so the local database can never end
+                # up holding more than one registration record.
+                try:
+                    if get_staff_count() > 0:
+                        clear_all_staff()
+                except Exception:
+                    logger.exception("Failed to clear previous registration before saving new one.")
+
+                try:
+                    insert_staff(staff_data)
+                except sqlite3.IntegrityError as exc:
+                    # Do NOT retry every IntegrityError. A UNIQUE email/staff
+                    # number collision is a permanent validation error, not a
+                    # transient lock. Only retry a generated unique_id collision.
+                    message = str(exc).lower()
+                    if "unique_id" not in message:
+                        if "email" in message:
+                            title = "Email Already Registered"
+                            text = f"The email address '{email}' is already registered."
+                        elif "staff_number" in message:
+                            title = "Staff Number Already Registered"
+                            text = f"The staff number '{staff_number}' is already registered."
+                        else:
+                            title = "Registration Error"
+                            text = "A record with the same unique information already exists."
+                        logger.warning("Registration rejected by SQLite: %s", exc)
+                        self._show_registration_error(title, text)
+                        return
+
+                    staff_data["unique_id"] = self._generate_unique_staff_id()
+                    insert_staff(staff_data)
+                    new_unique_id = staff_data["unique_id"]
+
+                logger.info(
+                    "Staff '%s' inserted into SQLite database with Unique ID %s.",
+                    staff_data["fullname"], new_unique_id
+                )
+                self._submit_staff_registration_immediately(staff_data)
+
+                login_screen = self.root.get_screen("login")
+                if hasattr(login_screen.ids, "email"):
+                    login_screen.ids.email.text = staff_data["email"]
+                if hasattr(login_screen.ids, "password"):
+                    login_screen.ids.password.text = staff_data["password"]
+
+                def redirect_to_login(inst):
+                    dialog.dismiss()
+                    self.root.current = "login"
+
+                dialog = MDDialog(
+                    title="Registration Successful",
+                    text=(
+                        "Your account was created successfully!\n\n"
+                        f"Your Unique ID is: {new_unique_id}\n"
+                        "(You'll also see this on your Dashboard.)\n\n"
+                        "Please log in to continue."
+                    ),
+                    buttons=[MDFlatButton(text="OK", on_release=redirect_to_login)]
+                )
+                dialog.open()
+
+        except sqlite3.OperationalError as exc:
+            if "locked" in str(exc).lower():
+                logger.exception("SQLite database remained locked during staff registration.")
+                self._show_registration_error(
+                    "Database Busy",
+                    "The local database is busy. Please wait a few seconds and submit again."
+                )
+            else:
+                logger.exception("Database error during staff registration.")
+                self._show_registration_error(
+                    "Database Error",
+                    "The registration could not be saved. Please try again."
+                )
+        except Exception:
+            logger.exception("Error during staff registration submission:")
+            self._show_registration_error(
+                "Registration Error",
+                "An unexpected error occurred while saving the registration."
+            )
+
+    def _show_registration_error(self, title, text):
+        """Display a registration error without crashing the app."""
+        try:
+            dialog = MDDialog(
+                title=title,
+                text=text,
+                buttons=[MDFlatButton(text="OK", on_release=lambda *_: dialog.dismiss())]
+            )
+            dialog.open()
+        except Exception:
+            logger.exception("Unable to display registration error dialog.")
+
+
+    # -----------------------------
+    # Attendance Reports (period-filtered + all-time export)
+    # -----------------------------
+    def open_reports(self):
+        self.root.current = "reports"
+        if not self.current_user:
+            return
+        now = datetime.now()
+        ids = self.reports_screen.ids
+        ids.report_month_spinner.text = now.strftime("%B")
+        ids.report_year_spinner.text = str(now.year)
+        ids.report_day_spinner.text = "All Days (Monthly)"
+        self._populate_report_profile_header()
+        if hasattr(ids, "report_status_label"):
+            ids.report_status_label.text = "Choose a period and press GENERATE REPORT to create the report."
+
+    def _populate_report_profile_header(self):
+        if not self.current_user:
+            return
+        ids = self.reports_screen.ids
+        user = self.current_user
+        fullname = str(user[1]) if len(user) > 1 and user[1] else "-"
+        employment_type = str(user[12]) if len(user) > 12 and user[12] else "-"
+        cluster = str(user[14]) if len(user) > 14 and user[14] else "-"
+        position = str(user[17]) if len(user) > 17 and user[17] else "-"
+        base_gps = str(user[26]) if len(user) > 26 and user[26] else self.static_gps
+
+        if hasattr(ids, 'report_name'):
+            ids.report_name.text = f"Name: {fullname}"
+        if hasattr(ids, 'report_employment_type'):
+            ids.report_employment_type.text = f"Employment Type: {employment_type}"
+        if hasattr(ids, 'report_cluster'):
+            ids.report_cluster.text = f"Cluster: {cluster}"
+        if hasattr(ids, 'report_position'):
+            ids.report_position.text = f"Position: {position}"
+        if hasattr(ids, 'report_base_gps'):
+            ids.report_base_gps.text = f"Base GPS / Office Coordinate: {base_gps}"
+
+    def _fetch_attendance_records(self, email_val, year=None, month=None, day=None):
+        """Fetches attendance rows for a staff email. Passing year=None returns
+        the FULL history to date (used by the all-time export)."""
+        db_path = os.path.join(os.path.dirname(__file__), "attendance.db")
+        if not email_val or not os.path.exists(db_path):
+            return []
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        try:
+            if year is None:
+                cursor.execute(
+                    "SELECT check_in_time, check_out_time, late_duration, attendance_status, "
+                    "gps_location, check_out_gps_location, current_state_office "
+                    "FROM attendance WHERE email = ? ORDER BY check_in_time ASC",
+                    (email_val,)
+                )
+            else:
+                if day and day != "All Days (Monthly)":
+                    prefix = f"{year:04d}-{month:02d}-{int(day):02d}"
+                else:
+                    prefix = f"{year:04d}-{month:02d}-"
+                cursor.execute(
+                    "SELECT check_in_time, check_out_time, late_duration, attendance_status, "
+                    "gps_location, check_out_gps_location, current_state_office "
+                    "FROM attendance WHERE email = ? AND check_in_time LIKE ? ORDER BY check_in_time ASC",
+                    (email_val, f"{prefix}%")
+                )
+            return cursor.fetchall()
+        finally:
+            conn.close()
+
+    def generate_report(self):
+        """Builds the on-screen period report (Present/Absent/Late + daily table)
+        from real attendance records for the selected month/year/day."""
+        try:
+            if not self.current_user:
+                return
+            ids = self.reports_screen.ids
+            email_val = str(self.current_user[20]) if len(self.current_user) > 20 else ""
+
+            self._populate_report_profile_header()
+
+            month_name = ids.report_month_spinner.text
+            year = int(ids.report_year_spinner.text)
+            day_sel = ids.report_day_spinner.text
+            month = list(calendar.month_name).index(month_name)
+
+            rows = self._fetch_attendance_records(email_val, year, month, day_sel)
+            self._last_report_rows = rows
+
+            present_days = len(set(r[0][:10] for r in rows if r[0]))
+            late_count = sum(1 for r in rows if r[3] and "Late" in r[3])
+
+            # Missing attendance rows are not automatic absences.
+            absent_days = len(set(r[0][:10] for r in rows if r[0] and r[3] and "absent" in str(r[3]).lower()))
+
+            if hasattr(ids, 'report_present_label'):
+                ids.report_present_label.text = f"Present: {present_days} Day(s)"
+            if hasattr(ids, 'report_absent_label'):
+                ids.report_absent_label.text = f"Absent: {absent_days} Day(s)"
+            if hasattr(ids, 'report_late_label'):
+                ids.report_late_label.text = f"Total Late Occurrences: {late_count}"
+
+            container = ids.report_rows_container
+            container.clear_widgets()
+            for check_in, check_out, late, status, gps, checkout_gps in rows:
+                date_str = check_in[:10] if check_in else "-"
+                in_time = check_in[11:16] if check_in and len(check_in) > 15 else "-"
+                out_time = check_out[11:16] if check_out and len(check_out) > 15 else "Pending"
+                in_within, _ = self._check_geofence(gps)
+                in_status = "In:Within" if in_within else "In:Not Within"
+                if checkout_gps:
+                    out_within, _ = self._check_geofence(checkout_gps)
+                    out_status = "Out:Within" if out_within else "Out:Not Within"
+                else:
+                    out_status = "Out:Pending"
+                gps_status = f"{in_status} | {out_status}"
+
+                row = MDBoxLayout(orientation='horizontal', spacing=dp(4), size_hint_y=None, height=dp(28))
+                row.add_widget(MDLabel(text=date_str, font_style="Caption"))
+                row.add_widget(MDLabel(text=f"{in_time} / {out_time}", font_style="Caption"))
+                row.add_widget(MDLabel(text=late or "-", font_style="Caption"))
+                row.add_widget(MDLabel(text=gps_status, font_style="Caption"))
+                container.add_widget(row)
+
+            period_desc = f"{month_name} {year}" if day_sel == "All Days (Monthly)" else f"{day_sel} {month_name} {year}"
+            if hasattr(ids, 'report_status_label'):
+                ids.report_status_label.text = f"{len(rows)} record(s) found for {period_desc}"
+        except Exception:
+            logger.exception("Error generating report:")
+
+    def _staff_registration_headers_and_rows(self):
+        """Build the complete staff registration export from every local staff
+        record. Passwords and sync flags are never exported."""
+        db_path = os.path.join(os.path.dirname(__file__), "attendance.db")
+        conn = sqlite3.connect(db_path, timeout=10)
+        try:
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(staff)")
+            columns = [row[1] for row in cursor.fetchall()]
+            if not columns:
+                return [], []
+
+            cursor.execute("SELECT * FROM staff ORDER BY id ASC")
+            rows = cursor.fetchall()
+            excluded = {"password", "synced"}
+            display_names = {
+                "id": "Database ID", "fullname": "Full Name", "sex": "Sex",
+                "dob": "Date of Birth", "blood_group": "Blood Group",
+                "marital_status": "Marital Status", "nationality": "Nationality",
+                "state_origin": "State of Origin", "lga": "LGA",
+                "address": "Residential Address", "next_of_kin": "Next of Kin",
+                "next_of_kin_phone": "Next of Kin Phone", "employment_type": "Employment Type",
+                "state_office": "State Office", "cluster": "Cluster", "department": "Department",
+                "section": "Section", "position": "Position", "staff_number": "Staff Number",
+                "phone": "Phone", "email": "Office Email", "facebook": "Facebook",
+                "twitter": "Twitter", "instagram": "Instagram", "telegram": "Telegram",
+                "linkedin": "LinkedIn", "gps_coordinate": "Office GPS Coordinate",
+                "photo": "Staff Photo Path", "unique_id": "Unique ID",
+                "genotype": "Genotype", "reintegration_status": "Reintegration Status",
+            }
+            included = [(idx, col) for idx, col in enumerate(columns) if col not in excluded]
+            headers = [display_names.get(col, col.replace("_", " ").title()) for _, col in included]
+            data_rows = []
+            for row in rows:
+                data_rows.append([
+                    "-" if row[idx] in (None, "") else str(row[idx])
+                    for idx, _ in included
+                ])
+            return headers, data_rows
+        finally:
+            conn.close()
+
+    def _report_type_export(self, report_type, fmt):
+        """Generates the selected report type (Staff Registration / Attendance
+        - Selected Period / Attendance - Full History) in the given format and
+        returns the saved filepath, or None on failure (status label is set
+        either way)."""
+        if not self.current_user:
+            self._show_report_status("Please log in first.")
+            return None
+        try:
+            reports_dir = self._get_download_dir()
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            fullname_safe = str(self.current_user[1]).replace(" ", "_") if len(self.current_user) > 1 else "staff"
+
+            if report_type == "staff_registration":
+                headers, data_rows = self._staff_registration_headers_and_rows()
+                title = "ROHI Staff Registration Details"
+                scope = "staff-registration"
+            elif report_type == "attendance_history":
+                email_val = str(self.current_user[20]) if len(self.current_user) > 20 else ""
+                rows = self._fetch_attendance_records(email_val)
+                headers, data_rows = self._report_headers_and_rows(rows)
+                title = "ROHI Attendance Report (All Time To Date)"
+                scope = "all-time-to-date"
+            else:  # "attendance" - currently selected report period
+                headers, data_rows = self._report_headers_and_rows(getattr(self, '_last_report_rows', []))
+                title = "ROHI Attendance Report (Selected Period)"
+                scope = "selected-period"
+
+            ext = "pdf" if fmt == "pdf" else "xlsx"
+            filename = f"{scope}_{fullname_safe}_{timestamp}.{ext}"
+            filepath = os.path.join(reports_dir, filename)
+
+            if fmt == "pdf":
+                self._build_pdf(filepath, title, headers, data_rows, password=REPORT_EXPORT_PASSWORD)
+            else:
+                if report_type == "staff_registration":
+                    filepath = self._export_staff_template()
+                elif report_type in ("attendance", "attendance_history"):
+                    filepath = self._export_attendance_template(
+                        getattr(self, "_last_report_rows", []) if report_type == "attendance"
+                        else self._fetch_attendance_records(str(self.current_user[20]))
+                    )
+                else:
+                    self._build_excel(filepath, headers, data_rows, sheet_title=title[:31],
+                                       password=REPORT_EXPORT_PASSWORD)
+
+            self._last_export_path = filepath
+            self._show_report_status(f"Exported: {filepath}")
+            if fmt == "xlsx":
+                sync_type = "staff" if report_type == "staff_registration" else "attendance"
+                self._queue_excel_auto_sync(filepath, sync_type)
+            return filepath
+        except ImportError as e:
+            logger.exception("Missing export library:")
+            self._show_report_status(f"Export library not installed ({e}). Add it to buildozer.spec requirements.")
+            return None
+        except Exception:
+            logger.exception("Error exporting report:")
+            self._show_report_status("Error exporting report - see logs.")
+            return None
+
+    REPORT_TYPE_OPTIONS = [
+        ("Attendance - Selected Period", "attendance"),
+        ("Attendance - Full History", "attendance_history"),
+        ("Complete Staff Registration", "staff_registration"),
+    ]
+
+    def open_report_type_menu(self):
+        items = [
+            {
+                "text": label,
+                "viewclass": "OneLineListItem",
+                "on_release": lambda x=label: self._select_report_type(x),
+            }
+            for label, _ in self.REPORT_TYPE_OPTIONS
+        ]
+        self._dismiss_active_menu()
+        self.active_menu = MDDropdownMenu(
+            caller=self.reports_screen.ids.report_type_field,
+            items=items,
+            width_mult=5,
+        )
+        self.active_menu.open()
+
+    def _select_report_type(self, label):
+        self.reports_screen.ids.report_type_field.text = label
+        self._dismiss_active_menu()
+
+    def generate_selected_report(self):
+        """One export button for the three report choices.
+
+        All three choices generate an Excel workbook so the same button has a
+        predictable result. The mail icon beside it can then share the exact
+        file that was generated.
+        """
+        ids = self.reports_screen.ids
+        label = ids.report_type_field.text.strip() if hasattr(ids, 'report_type_field') else ""
+        type_map = dict(self.REPORT_TYPE_OPTIONS)
+        report_type = type_map.get(label)
+        if not report_type:
+            self._show_report_status("Select a report type first.")
+            return
+        self._report_type_export(report_type, fmt="excel")
+
+    def generate_and_email_report(self):
+        """Generate the Attendance report and open Android's email/share composer."""
+        self.generate_selected_report()
+        return self.email_attendance_report()
+
+    def _report_headers_and_rows(self, rows):
+        """Convert attendance rows into the ROHI report.
+        Registered State Office stays fixed, while Current State Office is
+        captured from the actual GPS location used for the attendance event."""
+        if not self.current_user:
+            return [], []
+        user = self.current_user
+        fullname = str(user[1]) if len(user) > 1 and user[1] else "-"
+        sex = str(user[2]) if len(user) > 2 and user[2] else "-"
+        registered_state_office = str(user[13]) if len(user) > 13 and user[13] else "-"
+        cluster = str(user[14]) if len(user) > 14 and user[14] else "-"
+        position = str(user[17]) if len(user) > 17 and user[17] else "-"
+        unique_id = str(user[29]) if len(user) > 29 and user[29] else "-"
+        if unique_id == "-":
+            unique_id = str(user[18]) if len(user) > 18 and user[18] else "-"
+        base_gps = str(user[26]) if len(user) > 26 and user[26] else self.static_gps
+        staff_number = str(user[18]) if len(user) > 18 and user[18] else "-"
+
+        headers = [
+            "SN", "Unique Id", "Staff ID", "Date", "Name", "Sex", "Positìon",
+            "State Office", "State office Cordinates", "Cluster",
+            "Check in", "Late Hour", "check in Time", "Check in current", "Meter Range",
+            "Check in Status ", "check out", "overtime ours", "check out time",
+            "check out current  coordinated ", "check out gps current State",
+            "Verified Check in", "Verified check out"
+        ]
+
+        data_rows = []
+        for sn, raw in enumerate(rows, start=1):
+            check_in = raw[0] if len(raw) > 0 else ""
+            check_out = raw[1] if len(raw) > 1 else ""
+            late = raw[2] if len(raw) > 2 else ""
+            status = raw[3] if len(raw) > 3 else ""
+            gps = raw[4] if len(raw) > 4 else ""
+            checkout_gps = raw[5] if len(raw) > 5 else ""
+            current_state = raw[6] if len(raw) > 6 else ""
+
+            date_str = check_in[:10] if check_in else "-"
+            in_time = check_in[11:19] if check_in and len(check_in) > 15 else "-"
+            out_time = check_out[11:19] if check_out and len(check_out) > 15 else "-"
+
+            check_in_word = "present" if check_in else "absent"
+            check_out_word = "present" if check_out else ("pending" if check_in else "absent")
+
+            in_within, in_distance = self._check_geofence(gps) if gps else (False, None)
+            meter_range = f"{in_distance:.0f} m" if in_distance is not None else "-"
+            in_gps_status = "Within office range" if in_within else "Not within office Range"
+            verified_in = "Yes" if in_within else ("No" if gps else "-")
+
+            inferred_current, _ = self._nearest_configured_office(gps) if gps else (None, None)
+            current_state = current_state or inferred_current or "-"
+
+            if checkout_gps:
+                out_within, out_distance = self._check_geofence(checkout_gps)
+                out_state, _ = self._nearest_configured_office(checkout_gps)
+                out_state = out_state or (current_state if out_within else "Unverified")
+                verified_out = "Yes" if out_within else "No"
+            else:
+                out_state = "-"
+                verified_out = "-"
+
+            overtime_hours = "-"
+            if check_in and check_out:
+                try:
+                    t_in = datetime.strptime(check_in, "%Y-%m-%d %H:%M:%S")
+                    t_out = datetime.strptime(check_out, "%Y-%m-%d %H:%M:%S")
+                    worked = (t_out - t_in).total_seconds() / 3600
+                    overtime_hours = f"{max(worked - 8, 0):.1f}"
+                except Exception:
+                    overtime_hours = "-"
+
+            data_rows.append([
+                sn, unique_id, staff_number, date_str, fullname, sex, position,
+                registered_state_office, base_gps, cluster,
+                check_in_word, late or "On Time", in_time, gps or "-", meter_range,
+                in_gps_status, check_out_word, overtime_hours, out_time,
+                checkout_gps or "-", current_state, verified_in, verified_out
+            ])
+        return headers, data_rows
+
+    def _build_pdf(self, filepath, title, headers, data_rows, password=None):
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.lib import colors
+        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+        from reportlab.lib.styles import getSampleStyleSheet
+
+        doc = SimpleDocTemplate(filepath, pagesize=landscape(A4))
+        styles = getSampleStyleSheet()
+        elements = [Paragraph(title, styles['Title']), Spacer(1, 12)]
+        table = Table([headers] + [[str(c) for c in row] for row in data_rows], repeatRows=1)
+        table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#227A29')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('FONTSIZE', (0, 0), (-1, -1), 7),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#F0F0F0')]),
+        ]))
+        elements.append(table)
+        doc.build(elements)
+
+        if password:
+            self._encrypt_pdf_open_password(filepath, password)
+
+    @staticmethod
+    def _encrypt_pdf_open_password(filepath, password):
+        """Locks the exported PDF so it can't be opened without the password.
+        Uses pypdf, a pure-Python library (no compiled/native dependency),
+        so it's safe to bundle in the Android build."""
+        try:
+            from pypdf import PdfReader, PdfWriter
+
+            reader = PdfReader(filepath)
+            writer = PdfWriter()
+            for page in reader.pages:
+                writer.add_page(page)
+            writer.encrypt(password)
+            with open(filepath, "wb") as f:
+                writer.write(f)
+            logger.info(f"Applied open-password encryption to {filepath}")
+        except ImportError:
+            logger.warning("pypdf not installed - exported PDF report is NOT password protected. Add 'pypdf' to buildozer.spec requirements.")
+        except Exception:
+            logger.exception(f"Could not apply open-password encryption to {filepath}")
+
+    def _template_path(self, filename):
+        return os.path.join(APP_DIR, "templates", filename)
+
+    def _copy_template(self, filename, filepath):
+        source = self._template_path(filename)
+        if not os.path.exists(source):
+            raise FileNotFoundError(f"Missing report template: {source}")
+        shutil.copy2(source, filepath)
+
+    def _export_staff_template(self, for_sync=False):
+        """Export all staff using the uploaded ROHI Staff on IMS workbook as
+        the visual template, preserving logo, borders, row heights and widths."""
+        reports_dir = self._get_download_dir()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if for_sync:
+            filepath = os.path.join(reports_dir, "ROHI_Staff_on_IMS_AutoSync.xlsx")
+        else:
+            filepath = os.path.join(reports_dir, f"ROHI_Staff_on_IMS_{timestamp}.xlsx")
+        self._copy_template("Rohi_Staff on IMS.xlsx", filepath)
+
+        wb = openpyxl.load_workbook(filepath)
+        ws = wb.active
+        headers, data_rows = self._staff_registration_headers_and_rows()
+        # Template header is fixed at row 3. Use the template's exact order;
+        # write values beginning at row 4 and keep its existing dimensions.
+        template_headers = [ws.cell(3, c).value for c in range(1, ws.max_column + 1)]
+        index_map = {str(h).strip().lower(): i for i, h in enumerate(headers)}
+        for r in range(4, ws.max_row + 1):
+            for c in range(1, ws.max_column + 1):
+                ws.cell(r, c).value = None
+
+        from copy import copy as _copy
+        template_row_height = ws.row_dimensions[4].height
+        template_styles = {
+            c: _copy(ws.cell(4, c)._style) for c in range(1, ws.max_column + 1)
+        }
+        template_alignment = {
+            c: _copy(ws.cell(4, c).alignment) for c in range(1, ws.max_column + 1)
+        }
+        template_number_formats = {
+            c: ws.cell(4, c).number_format for c in range(1, ws.max_column + 1)
+        }
+        for r_idx, row in enumerate(data_rows, start=4):
+            if r_idx > ws.max_row:
+                ws.insert_rows(r_idx)
+            if template_row_height is not None:
+                ws.row_dimensions[r_idx].height = template_row_height
+            for c_idx, h in enumerate(template_headers, start=1):
+                cell = ws.cell(r_idx, c_idx)
+                if r_idx > 4:
+                    cell._style = _copy(template_styles.get(c_idx))
+                    cell.alignment = _copy(template_alignment.get(c_idx))
+                    cell.number_format = template_number_formats.get(c_idx, "General")
+                pos = index_map.get(str(h).strip().lower())
+                value = row[pos] if pos is not None and pos < len(row) else "-"
+                cell.value = value
+
+        wb.save(filepath)
+        try:
+            self._encrypt_xlsx_open_password(filepath, REPORT_EXPORT_PASSWORD)
+        except Exception:
+            logger.exception("Could not password-protect staff template export.")
+        self._last_export_path = filepath
+        return filepath
+
+    def _export_attendance_template(self, rows, title_suffix="Selected", directory=None):
+        """Export attendance using the uploaded attendance workbook template.
+
+        ``directory`` lets a caller build the workbook somewhere other than
+        the visible phone Downloads folder (used for "Send to Google" so it
+        never has to write to Downloads or touch the export status)."""
+        reports_dir = directory or self._get_download_dir()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filepath = os.path.join(reports_dir, f"Rohi_Attendance_Report_{_safe_filename(title_suffix)}_{timestamp}.xlsx")
+        self._copy_template("Rohi_Attendance Report.xlsx", filepath)
+        wb = openpyxl.load_workbook(filepath)
+        ws = wb.active
+        headers, data_rows = self._report_headers_and_rows(rows)
+
+        # Keep the template's header row (row 2) and widths. Data starts at row 3.
+        for c, h in enumerate(headers, start=1):
+            ws.cell(2, c).value = h
+        # Clear old data rows and append new rows without altering the template
+        # column widths or logo dimensions.
+        if ws.max_row >= 3:
+            for row_num in range(3, ws.max_row + 1):
+                for c in range(1, ws.max_column + 1):
+                    ws.cell(row_num, c).value = None
+        for r_idx, row in enumerate(data_rows, start=3):
+            if r_idx > ws.max_row:
+                ws.insert_rows(r_idx)
+            for c_idx, value in enumerate(row, start=1):
+                ws.cell(r_idx, c_idx).value = value
+        wb.save(filepath)
+        try:
+            self._encrypt_xlsx_open_password(filepath, REPORT_EXPORT_PASSWORD)
+        except Exception:
+            logger.exception("Could not password-protect attendance template export.")
+        if directory is None:
+            self._last_export_path = filepath
+        return filepath
+
+    def _export_timesheet_template(self, for_sync=False, directory=None):
+        """Populate the exact uploaded Corrected Timesheet.xlsx template.
+        Column widths, row heights, logo, thick/thin borders and merged cells
+        remain from the supplied workbook.
+
+        ``directory`` lets a caller build the workbook somewhere other than
+        the visible phone Downloads folder (e.g. a private temp folder used
+        only to build a file for "Send to Google", without ever writing to
+        Downloads or touching the on-screen export status)."""
+        rows = getattr(self, "_last_timesheet_rows", [])
+        if not rows:
+            return None
+        ids = self.timesheet_screen.ids
+        month_name = ids.timesheet_month_spinner.text
+        year = ids.timesheet_year_spinner.text
+        user = self.current_user
+        fullname = str(user[1]) if user and len(user) > 1 and user[1] else "Staff"
+        staff_id = str(user[18]) if user and len(user) > 18 and user[18] else "-"
+        cluster = str(user[14]) if user and len(user) > 14 and user[14] else "-"
+        state_office = str(user[13]) if user and len(user) > 13 and user[13] else "-"
+        nationality = str(user[6]) if user and len(user) > 6 and user[6] else "-"
+
+        reports_dir = directory or self._get_download_dir()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Human-readable and state-sortable filename: A Umar 08-2026 Borno.
+        # Slash cannot be used safely in Android filenames, so month/year uses
+        # a hyphen in the filename while the workbook period remains month/year.
+        name_parts = str(fullname).strip().split()
+        short_name = ((name_parts[0][0].upper() + " " + name_parts[-1])
+                      if len(name_parts) >= 2 else (name_parts[0] if name_parts else "Staff"))
+        office_short = re.sub(r"\s+(State Office|HQ)$", "", state_office, flags=re.I).strip() or "Unassigned"
+        if for_sync:
+            filename = f"{short_name} {month_name_to_number(month_name):02d}-{year} {office_short}.xlsx"
+        else:
+            filename = f"{short_name} {month_name_to_number(month_name):02d}-{year} {office_short}.xlsx"
+        filepath = os.path.join(reports_dir, filename)
+        self._copy_template("Corrected Timesheet.xlsx", filepath)
+        wb = openpyxl.load_workbook(filepath)
+        ws = wb.active
+
+        ws["C3"] = f"{month_name.upper()} {year}"
+        ws["B4"] = fullname
+        ws["B5"] = staff_id
+        ws["F3"] = cluster or state_office
+        ws["F4"] = state_office
+        ws["F5"] = nationality
+
+        # Exact 31-day pay period rows from the uploaded template.
+        for idx, row in enumerate(rows, start=8):
+            date_label, day_name, hours_cell = row
+            ws.cell(idx, 1).value = date_label
+            ws.cell(idx, 2).value = day_name
+            # Weekend rows are merged in the source template; only write the
+            # value into the merged range's top-left cell.
+            try:
+                ws.cell(idx, 3).value = hours_cell
+            except AttributeError:
+                pass
+        # The supplied template already keeps the lower cells of merged
+        # weekend ranges empty. Do not write to MergedCell placeholders.
+
+        ws["C39"] = "=SUM(C8:C38)"
+        # Signature: keep template column widths and place a scaled image over
+        # B46:D47 so it fits the existing signature area without distorting it.
+        sig_path = getattr(self, "signature_path", None)
+        if sig_path and os.path.exists(sig_path):
+            try:
+                from openpyxl.drawing.image import Image as XLImage
+                img = XLImage(sig_path)
+                max_w, max_h = 190, 55
+                ratio = min(max_w / img.width, max_h / img.height, 1.0)
+                img.width = int(img.width * ratio)
+                img.height = int(img.height * ratio)
+                ws.add_image(img, "B46")
+            except Exception:
+                logger.exception("Could not embed signature image in timesheet template.")
+
+        # Keep the supplied template's signature lines.
+        ws["A46"] = "Employee Signature: ____________________________"
+        ws["A49"] = "Supervisor Signature: ____________________________"
+        wb.save(filepath)
+        if directory is None:
+            self._last_export_path = filepath
+        return filepath
+
+    def _build_excel(self, filepath, headers, data_rows, sheet_title="Report", password=None):
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill, Alignment
+        from openpyxl.utils import get_column_letter
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = sheet_title
+
+        # ---- Logo + title band (rows 1-2), then the exact template header
+        # layout starts at row 3 so the column structure/colors below match
+        # the ROHI attendance report template exactly. ----
+        header_row = 1
+        app_dir = os.path.dirname(os.path.abspath(__file__))
+        logo_candidates = [
+            os.path.join(app_dir, "rohi_logo.png"),
+            os.path.join(app_dir, "Images", "rohi_logo.png"),
+        ]
+        logo_path = next((candidate for candidate in logo_candidates if os.path.exists(candidate)), None)
+        if logo_path:
+            try:
+                from openpyxl.drawing.image import Image as XLImage
+                img = XLImage(logo_path)
+                img.width, img.height = 32, 32
+                ws.add_image(img, "A1")
+                ws.row_dimensions[1].height = 38
+            except Exception:
+                logger.exception("Could not embed ROHI logo in exported report:")
+        ws.merge_cells(start_row=1, start_column=2, end_row=1, end_column=len(headers))
+        title_cell = ws.cell(row=1, column=2, value=f"RESTORATION OF HOPE INITIATIVE (ROHI) - {sheet_title}")
+        title_cell.font = Font(bold=True, size=13)
+        title_cell.alignment = Alignment(horizontal="center", vertical="center")
+        ws.row_dimensions[2].height = 6  # thin spacer row
+        header_row = 3
+
+        for col_idx, h in enumerate(headers, start=1):
+            ws.cell(row=header_row, column=col_idx, value=h)
+        # Green fill + bold white text ONLY on columns D through T (Name
+        # through "check out gps current State") - matching the template
+        # exactly, where SN/Unique Id/Date and the two "Verified" columns
+        # are left unstyled.
+        for col_idx in range(4, len(headers) + 1):  # style report fields; ID columns remain plain
+            cell = ws.cell(row=header_row, column=col_idx)
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill(start_color="227A29", end_color="227A29", fill_type="solid")
+
+        for row in data_rows:
+            ws.append(row)
+
+        # ---- Column widths matching the template ----
+        template_widths = {
+            "D": 14, "E": 13.05, "H": 16.95, "J": 9.95, "K": 16.01, "L": 11.97,
+            "N": 18.56, "O": 11.97, "P": 27.98, "Q": 15.33, "R": 16.41,
+            "T": 23.95, "U": 24.48, "V": 28, "W": 72.24,
+        }
+        for letter, width in template_widths.items():
+            ws.column_dimensions[letter].width = width
+        # Fall back to auto-fit for any column not explicitly sized above.
+        for col_idx in range(1, len(headers) + 1):
+            letter = get_column_letter(col_idx)
+            if letter in template_widths:
+                continue
+            values = [headers[col_idx - 1]] + [str(r[col_idx - 1]) for r in data_rows if r[col_idx - 1] is not None]
+            max_len = max((len(v) for v in values), default=8)
+            ws.column_dimensions[letter].width = max_len + 2
+
+        if password:
+            # Sheet-level lock (works even if the full-file encryption below
+            # can't run) - prevents editing without the password.
+            ws.protection.sheet = True
+            ws.protection.password = password
+
+        wb.save(filepath)
+
+        if password:
+            self._encrypt_xlsx_open_password(filepath, password)
+
+    @staticmethod
+    def _encrypt_xlsx_open_password(filepath, password):
+        """Locks the .xlsx file itself so it cannot be OPENED at all without
+        the password (not just edit-protection). Requires msoffcrypto-tool +
+        cryptography, both listed in buildozer.spec. If either isn't
+        available on this build, the file still has the sheet-level lock
+        applied above, and the export is not blocked."""
+        try:
+            import io
+            import msoffcrypto
+            from msoffcrypto.format.ooxml import OOXMLFile
+
+            with open(filepath, "rb") as f:
+                plain_bytes = f.read()
+
+            office_file = OOXMLFile(io.BytesIO(plain_bytes))
+            encrypted = io.BytesIO()
+            office_file.encrypt(password, encrypted)
+
+            with open(filepath, "wb") as f:
+                f.write(encrypted.getvalue())
+            logger.info(f"Applied open-password encryption to {filepath}")
+        except ImportError:
+            logger.warning(
+                "msoffcrypto-tool not installed - exported report only has "
+                "sheet-edit protection, not a full open-password lock. "
+                "Add 'msoffcrypto-tool' and 'cryptography' to buildozer.spec requirements."
+            )
+        except Exception:
+            logger.exception(
+                f"Could not apply open-password encryption to {filepath}; "
+                "file was still saved with sheet-level protection only."
+            )
+
+    def _get_download_dir(self):
+        """Resolve the phone's public Download folder so generated reports show up
+        where the user actually looks for downloaded files, instead of being
+        buried inside the app's private storage."""
+        if platform == "android":
+            try:
+                from jnius import autoclass
+                Environment = autoclass('android.os.Environment')
+                download_dir = Environment.getExternalStoragePublicDirectory(
+                    Environment.DIRECTORY_DOWNLOADS
+                ).getAbsolutePath()
+            except Exception:
+                logger.exception("Falling back to hardcoded Android Download path:")
+                download_dir = "/storage/emulated/0/Download"
+        else:
+            download_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+
+        os.makedirs(download_dir, exist_ok=True)
+        return download_dir
+
+    def _get_temp_sync_dir(self):
+        """Private, hidden folder used only to build a workbook in memory-like
+        fashion for "Send to Google". Never the phone's visible Downloads
+        folder, and never surfaced to the user - it's deleted right after
+        the upload finishes either way."""
+        temp_dir = os.path.join(self.user_data_dir, "temp_send_to_google")
+        os.makedirs(temp_dir, exist_ok=True)
+        return temp_dir
+
+    def _cleanup_temp_sync_file(self, filepath):
+        try:
+            if filepath and os.path.exists(filepath) and self._get_temp_sync_dir() in filepath:
+                os.remove(filepath)
+        except Exception:
+            logger.exception("Could not remove temporary send-to-Google file.")
+
+    def _show_report_status(self, message):
+        if hasattr(self, 'reports_screen') and hasattr(self.reports_screen.ids, 'report_status_label'):
+            self.reports_screen.ids.report_status_label.text = message
+        logger.info(message)
+
+    def _export_attendance_rows(self, rows, fmt, scope):
+        try:
+            if not self.current_user:
+                self._show_report_status("Please log in first.")
+                return
+            # Even with zero attendance rows (e.g. a brand-new staff member who
+            # hasn't checked in yet), still produce a downloadable file with the
+            # full header row so the report format is available from day one -
+            # it just has no data rows underneath until check-ins happen.
+            headers, data_rows = self._report_headers_and_rows(rows)
+            reports_dir = self._get_download_dir()
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            fullname_safe = (str(self.current_user[1]).replace(" ", "_")
+                              if self.current_user and len(self.current_user) > 1 else "staff")
+
+            if fmt == 'pdf':
+                filename = f"Attendance_{scope}_{fullname_safe}_{timestamp}.pdf"
+                filepath = os.path.join(reports_dir, filename)
+                self._build_pdf(filepath, f"ROHI Attendance Report ({scope.replace('-', ' ').title()})",
+                                 headers, data_rows, password=REPORT_EXPORT_PASSWORD)
+            else:
+                filename = f"Attendance_{scope}_{fullname_safe}_{timestamp}.xlsx"
+                filepath = os.path.join(reports_dir, filename)
+                self._build_excel(filepath, headers, data_rows, sheet_title="Attendance",
+                                   password=REPORT_EXPORT_PASSWORD)
+
+            self._last_export_path = filepath
+            self._show_report_status(f"Exported (password protected): {filepath}")
+        except ImportError as e:
+            logger.exception("Missing export library:")
+            self._show_report_status(f"Export library not installed ({e}). Add it to buildozer.spec requirements.")
+        except Exception:
+            logger.exception("Error exporting attendance report:")
+            self._show_report_status("Error exporting report - see logs.")
+
+    def export_report_pdf(self):
+        self._export_attendance_rows(getattr(self, '_last_report_rows', []), fmt='pdf', scope='selected-period')
+
+    def _share_file_via_android(self, filepath, subject, body, status_fn, package_name=None):
+        """Share a generated file through Android's mail/share chooser.
+
+        ACTION_SENDTO cannot carry file attachments. The previous code used
+        ACTION_SENDTO and also called Intent.createChooser(), which produced the
+        phone error about ``No static methods called createChooser``. This
+        implementation uses ACTION_SEND plus an Android content URI, then opens
+        the chooser as an ordinary ACTION_CHOOSER intent (no static Java method).
+        """
+        if not filepath or not os.path.exists(filepath):
+            status_fn("Generate the report first, then use Email.")
+            return False
+        if platform != 'android':
+            status_fn("Email sharing is available on Android only.")
+            return False
+
+        try:
+            from jnius import autoclass
+            Intent = autoclass('android.content.Intent')
+            Uri = autoclass('android.net.Uri')
+            BuildVersion = autoclass('android.os.Build$VERSION')
+            File = autoclass('java.io.File')
+            StrictMode = autoclass('android.os.StrictMode')
+
+            filename = os.path.basename(filepath)
+            lower = filename.lower()
+            if lower.endswith('.pdf'):
+                mime_type = 'application/pdf'
+            elif lower.endswith('.xlsx'):
+                mime_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            else:
+                mime_type = 'application/octet-stream'
+
+            activity = autoclass('org.kivy.android.PythonActivity').mActivity
+            resolver = activity.getContentResolver()
+            content_uri = None
+
+            # Android 10+ / API 29+: put a shareable copy in MediaStore
+            # Downloads and obtain a content:// URI that mail apps can read.
+            if BuildVersion.SDK_INT >= 29:
+                MediaStore = autoclass('android.provider.MediaStore')
+                ContentValues = autoclass('android.content.ContentValues')
+                values = ContentValues()
+                values.put(MediaStore.MediaColumns.DISPLAY_NAME, filename)
+                values.put(MediaStore.MediaColumns.MIME_TYPE, mime_type)
+                values.put(MediaStore.MediaColumns.RELATIVE_PATH, 'Download/ROHI Attendance')
+                values.put(MediaStore.MediaColumns.IS_PENDING, 1)
+                collection = MediaStore.Downloads.EXTERNAL_CONTENT_URI
+                content_uri = resolver.insert(collection, values)
+                if content_uri is None:
+                    raise RuntimeError('Android could not create a shareable Downloads URI.')
+                output_stream = resolver.openOutputStream(content_uri, 'w')
+                if output_stream is None:
+                    raise RuntimeError('Android could not open the shareable file.')
+                with open(filepath, 'rb') as source:
+                    while True:
+                        chunk = source.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        output_stream.write(chunk)
+                output_stream.close()
+                values_pending = ContentValues()
+                values_pending.put(MediaStore.MediaColumns.IS_PENDING, 0)
+                resolver.update(content_uri, values_pending, None, None)
+            else:
+                # Older Android: the generated file is already in public
+                # Downloads. Use a MediaStore content URI where possible.
+                MediaStoreFiles = autoclass('android.provider.MediaStore$Files')
+                ContentValues = autoclass('android.content.ContentValues')
+                values = ContentValues()
+                values.put(MediaStore.MediaColumns.DATA, filepath)
+                values.put(MediaStore.MediaColumns.DISPLAY_NAME, filename)
+                values.put(MediaStore.MediaColumns.MIME_TYPE, mime_type)
+                content_uri = resolver.insert(MediaStoreFiles.getContentUri('external'), values)
+                if content_uri is None:
+                    # Last-resort compatibility path for old Android releases.
+                    try:
+                        StrictMode.setVmPolicy(StrictMode.VmPolicy.Builder().build())
+                    except Exception:
+                        pass
+                    content_uri = Uri.fromFile(File(filepath))
+
+            send_intent = Intent(Intent.ACTION_SEND)
+            send_intent.setType(mime_type)
+            send_intent.putExtra(Intent.EXTRA_SUBJECT, subject)
+            send_intent.putExtra(Intent.EXTRA_TEXT, body)
+            send_intent.putExtra(Intent.EXTRA_STREAM, content_uri)
+            if package_name:
+                send_intent.setPackage(package_name)
+            send_intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+
+            if package_name:
+                # A package-targeted ACTION_SEND opens the requested app directly
+                # instead of presenting a chooser with other mail/share apps.
+                activity.startActivity(send_intent)
+                status_fn(f"Ready to send: {filename}")
+                return True
+
+            chooser = Intent(Intent.ACTION_CHOOSER)
+            chooser.putExtra(Intent.EXTRA_INTENT, send_intent)
+            chooser.putExtra(Intent.EXTRA_TITLE, 'Send Report via Email')
+            chooser.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            activity.startActivity(chooser)
+            status_fn(f"Ready to send: {filename}")
+            return True
+        except Exception as e:
+            logger.exception("Could not share generated file through Android:")
+            status_fn(f"Could not open email app: {e}")
+            return False
+
+    def email_last_export(self, status_fn=None):
+        """Open Android's share/email composer with the generated Attendance XLSX attached."""
+        status_fn = status_fn or self._show_report_status
+        filepath = getattr(self, '_last_export_path', None)
+        if not filepath or not os.path.exists(filepath) or "attendance" not in os.path.basename(filepath).lower():
+            self.generate_selected_report()
+            filepath = getattr(self, '_last_export_path', None)
+        return self._share_file_via_android(
+            filepath,
+            "ROHI Attendance Report",
+            "Attached is the generated ROHI Attendance Report.",
+            status_fn,
+            package_name="com.google.android.gm",
+        )
+
+    def email_attendance_report(self):
+        return self.email_last_export(self._set_report_send_status)
+
+    def email_timesheet_export(self):
+        """Open Android's share/email composer with the generated Timesheet XLSX attached."""
+        path = getattr(self, '_last_export_path', None)
+        if not path or not os.path.exists(path) or 'timesheet' not in os.path.basename(path).lower():
+            path = self.export_timesheet_excel()
+        return self._share_file_via_android(
+            path,
+            "ROHI Timesheet",
+            "Attached is the generated ROHI Timesheet.",
+            self._set_timesheet_send_status,
+            package_name="com.google.android.gm",
+        )
+
+    def email_leave_report(self):
+        """Open Android's share/email composer with the generated Leave XLSX attached."""
+        path = getattr(self, '_last_export_path', None)
+        if not path or not os.path.exists(path) or 'leave_report' not in os.path.basename(path).lower():
+            path = self.export_leave_excel()
+        return self._share_file_via_android(
+            path,
+            "ROHI Leave Management Report",
+            "Attached is the generated ROHI Leave Management report.",
+            self._set_leave_send_status,
+        )
+
+    def export_report_excel(self):
+        self._export_attendance_rows(getattr(self, '_last_report_rows', []), fmt='excel', scope='selected-period')
+
+    def export_all_attendance_pdf(self):
+        email_val = str(self.current_user[20]) if self.current_user and len(self.current_user) > 20 else ""
+        rows = self._fetch_attendance_records(email_val)
+        self._export_attendance_rows(rows, fmt='pdf', scope='all-time-to-date')
+
+    def export_all_attendance_excel(self):
+        email_val = str(self.current_user[20]) if self.current_user and len(self.current_user) > 20 else ""
+        rows = self._fetch_attendance_records(email_val)
+        self._export_attendance_rows(rows, fmt='excel', scope='all-time-to-date')
+
+    # -----------------------------
+    # DWPT / Monthly Report
+    # -----------------------------
+    def _registered_state_office(self):
+        try:
+            return str(self.current_user[14] or '').strip() or 'Unassigned'
+        except Exception:
+            return 'Unassigned'
+
+    def open_dwpt(self):
+        if not self.current_user:
+            self.root.current = 'login'; return
+        try:
+            screen = self.dwpt_screen
+            ids = screen.ids
+            required = ("dwpt_staff", "dwpt_state", "dwpt_date")
+            missing = [name for name in required if name not in ids]
+            if missing:
+                raise RuntimeError(f"DWPT KV IDs missing: {missing}")
+            self.root.current = 'dwpt'
+            ids.dwpt_staff.text = f"Reported By: {self.current_user[1]}"
+            ids.dwpt_state.text = self._registered_state_office()
+            ids.dwpt_date.text = datetime.now().strftime('%Y-%m-%d')
+        except Exception:
+            logger.exception("Unable to open Daily/Weekly Performance Tracker - returning to dashboard.")
+            self.show_link_pending("Daily/Weekly Performance Tracker")
+            self.open_dashboard()
+
+    def set_dwpt_type(self, value):
+        self.dwpt_screen.ids.dwpt_type.text = value
+
+    def open_monthly_report(self):
+        if not self.current_user:
+            self.root.current = 'login'; return
+        try:
+            screen = self.monthly_report_screen
+            ids = screen.ids
+            required = ("monthly_staff", "monthly_date")
+            missing = [name for name in required if name not in ids]
+            if missing:
+                raise RuntimeError(f"Monthly Report KV IDs missing: {missing}")
+            self.root.current = 'monthly_report'
+            ids.monthly_staff.text = f"Reported By: {self.current_user[1]}"
+            ids.monthly_date.text = datetime.now().strftime('%Y-%m-%d')
+        except Exception:
+            logger.exception("Unable to open Monthly Report - returning to dashboard.")
+            self.show_link_pending("Monthly Report")
+            self.open_dashboard()
+
+    def open_report_gallery(self, kind):
+        limit = 2 if kind == 'dwpt' else 4
+        if not hasattr(self, '_report_images'): self._report_images = {'dwpt': [], 'monthly': []}
+        if len(self._report_images[kind]) >= limit:
+            self._set_gallery_status(kind, f'Maximum {limit} pictures reached.')
+            return
+        self._gallery_target = 'dwpt_report' if kind == 'dwpt' else 'monthly_report'
+        self._launch_filechooser()
+
+    def _set_gallery_status(self, target, message):
+        try:
+            if target == 'dwpt_report': self.dwpt_screen.ids.dwpt_photo_status.text = message
+            elif target == 'monthly_report': self.monthly_report_screen.ids.monthly_photo_status.text = message
+            else:
+                super_set = getattr(self, '_set_gallery_status_original', None)
+                if super_set: return super_set(target, message)
+        except Exception: pass
+
+    def _on_report_image_selected(self, source):
+        kind = 'dwpt' if self._gallery_target == 'dwpt_report' else 'monthly'
+        limit = 2 if kind == 'dwpt' else 4
+        if not hasattr(self, '_report_images'): self._report_images = {'dwpt': [], 'monthly': []}
+        if len(self._report_images[kind]) < limit:
+            self._report_images[kind].append(source)
+        count=len(self._report_images[kind])
+        self._set_gallery_status(self._gallery_target, f'Photos: {count}/{limit}')
+
+    def _report_upload(self, kind, fields, filename):
+        try:
+            path=os.path.join(APP_DIR, filename)
+            wb=openpyxl.Workbook(); ws=wb.active; ws.title='Report'
+            for k,v in fields: ws.append([k, v])
+            images=(getattr(self,'_report_images',{}) or {}).get(kind, [])
+            from openpyxl.drawing.image import Image as XLImage
+            for n,img_path in enumerate(images, start=1):
+                try:
+                    im=XLImage(img_path); im.width=420; im.height=300
+                    ws.add_image(im, f'D{1+(n-1)*18}')
+                except Exception: logger.exception('Could not embed report image')
+            wb.save(path)
+            self._last_export_path = path
+            endpoint=str(self._excel_sync_state.get(
+                'dwpt_endpoint' if kind=='dwpt' else 'monthly_report_endpoint',
+                EXCEL_SYNC_DEFAULTS.get('dwpt_endpoint' if kind=='dwpt' else 'monthly_report_endpoint','')
+            ) or '').strip()
+            ok,msg=_http_upload_excel(path, endpoint, kind, self._registered_state_office())
+            if ok: self.show_info_dialog('Report Sent', f"{msg}\n\nA copy was also saved on this device at:\n{path}")
+            else: self.show_info_dialog('Send Failed', f"{msg}\n\nA copy was still saved on this device at:\n{path}")
+        except Exception as exc:
+            logger.exception('Report generation failed')
+            self.show_info_dialog('Report Error', str(exc))
+
+    def submit_dwpt(self):
+        ids=self.dwpt_screen.ids
+        if not ids.dwpt_report.text.strip(): self.show_info_dialog('DWPT','Please write the daily/weekly report.'); return
+        self._report_upload('dwpt', [('Report Type',ids.dwpt_type.text),('Date',ids.dwpt_date.text),('State Office',ids.dwpt_state.text),('Location',ids.dwpt_location.text),('Project',ids.dwpt_project.text),('Activity / Sub-Activity',ids.dwpt_activity.text),('Reported By',self.current_user[1]),('Performance Report',ids.dwpt_report.text),('Key Achievement',ids.dwpt_achievement.text),('Challenge / Issue',ids.dwpt_challenge.text)], 'ROHI_DWPT.xlsx')
+
+    def submit_monthly_report(self):
+        ids=self.monthly_report_screen.ids
+        if not ids.monthly_narrative.text.strip(): self.show_info_dialog('Monthly Report','Please complete the narrative.'); return
+        self._report_upload('monthly', [('ROHI','RESTORATION OF HOPE INITIATIVE'),('Date',ids.monthly_date.text),('Location',ids.monthly_location.text),('Project',ids.monthly_project.text),('Duration',ids.monthly_duration.text),('Type of Activity','Monthly Summary Report'),('Sub-Activity',ids.monthly_subactivity.text),('Reported By',self.current_user[1]),('Narrative',ids.monthly_narrative.text),('Achievements',ids.monthly_achievements.text)], 'ROHI_Monthly_Report.xlsx')
+
+    # -----------------------------
+    # Complaints & Feedback Mechanism (CFM)
+    # -----------------------------
+    def open_cfm(self):
+        """Open the CFM screen and refresh local case counts/history."""
+        if not self.current_user:
+            self.root.current = "login"
+            return
+        self.root.current = "cfm"
+        try:
+            ids = self.cfm_screen.ids
+            if not ids.cfm_message.text or ids.cfm_message.text.startswith("Case submitted"):
+                ids.cfm_message.text = (
+                    "Information is handled confidentially for follow-up, safeguarding "
+                    "and programme improvement."
+                )
+            self._sync_cfm_statuses_from_google()
+            self.refresh_cfm_cases()
+        except Exception:
+            logger.exception("Unable to open CFM screen")
+
+    def cfm_today_date(self):
+        return datetime.now().strftime("%Y-%m-%d")
+
+    def _cfm_checked_value(self, ids, pairs, default=""):
+        for widget_id, value in pairs:
+            if getattr(ids, widget_id).active:
+                return value
+        return default
+
+    def _cfm_selected_methods(self, ids):
+        methods = []
+        for widget_id, value in (
+            ("method_suggestion", "Suggestion Box"),
+            ("method_person", "In Person"),
+            ("method_phone", "Phone"),
+            ("method_whatsapp", "WhatsApp"),
+            ("method_email", "Email"),
+            ("method_staff", "Staff/Volunteer"),
+            ("method_meeting", "Community Meeting"),
+            ("method_other", "Other"),
+        ):
+            if getattr(ids, widget_id).active:
+                methods.append(value)
+        if ids.method_other.active and ids.cfm_method_other.text.strip():
+            methods.append(ids.cfm_method_other.text.strip())
+        return ", ".join(methods) or "In Person"
+
+    def _cfm_selected_status(self, ids):
+        return self._cfm_checked_value(ids, (
+            ("status_open", "Open"),
+            ("status_review", "Under Review"),
+            ("status_closed", "Closed"),
+        ), "Open")
+
+    def _cfm_selected_urgency(self, ids):
+        return self._cfm_checked_value(ids, (
+            ("urgency_normal", "Normal"),
+            ("urgency_urgent", "Urgent"),
+            ("urgency_confidential", "Confidential/Sensitive"),
+            ("urgency_immediate", "Immediate protection concern"),
+        ), "Normal")
+
+    def open_cfm_type_menu(self):
+        """Show a real tap-to-select dropdown for CFM Type of Complaint / Feedback."""
+        try:
+            ids = self.cfm_screen.ids
+            caller = ids.cfm_type
+            if getattr(self, "_cfm_type_menu", None):
+                self._cfm_type_menu.dismiss()
+            options = [
+                "Complaint", "Suggestion", "Request for information",
+                "Appreciation/positive feedback", "Staff/volunteer conduct",
+                "Programme/service problem", "Selection/targeting issue",
+                "Distribution/assistance issue", "Delay/non-delivery of service",
+                "Fraud/corruption concern", "Safeguarding concern",
+                "Sexual exploitation/abuse or harassment concern",
+                "Discrimination/exclusion", "Other"
+            ]
+            self._cfm_type_menu = MDDropdownMenu(
+                caller=caller,
+                width_mult=5,
+                items=[{
+                    "text": value,
+                    "viewclass": "OneLineListItem",
+                    "on_release": lambda value=value: self._select_cfm_type(value),
+                } for value in options],
+            )
+            self._cfm_type_menu.open()
+        except Exception:
+            logger.exception("Unable to open CFM type dropdown")
+
+    def _select_cfm_type(self, value):
+        try:
+            self.cfm_screen.ids.cfm_type.text = value
+            self.cfm_screen.ids.cfm_type.focus = False
+            if getattr(self, "_cfm_type_menu", None):
+                self._cfm_type_menu.dismiss()
+        except Exception:
+            logger.exception("Unable to select CFM type")
+
+    def _open_cfm_simple_menu(self, caller_id, options, callback):
+        try:
+            caller = self.cfm_screen.ids[caller_id]
+            menu = MDDropdownMenu(
+                caller=caller, width_mult=4,
+                items=[{"text": v, "viewclass": "OneLineListItem",
+                        "on_release": lambda v=v: callback(v)} for v in options],
+            )
+            menu.open()
+            return menu
+        except Exception:
+            logger.exception("Unable to open CFM dropdown %s", caller_id)
+            return None
+
+    def open_cfm_case_document_menu(self):
+        def choose(v):
+            self.cfm_screen.ids.cfm_case_document.text = v
+            if getattr(self, "_cfm_case_document_menu", None): self._cfm_case_document_menu.dismiss()
+        self._cfm_case_document_menu = self._open_cfm_simple_menu(
+            "cfm_case_document", ["Electronic", "Hardcopy and filed", "Both"], choose)
+
+    def open_cfm_management_review_menu(self):
+        def choose(v):
+            self.cfm_screen.ids.cfm_review_management.text = v
+            if getattr(self, "_cfm_management_review_menu", None): self._cfm_management_review_menu.dismiss()
+        self._cfm_management_review_menu = self._open_cfm_simple_menu(
+            "cfm_review_management", ["Yes", "No"], choose)
+
+    def submit_cfm_case(self):
+        """Validate and save the CFM form exactly in the ROHI community/office format."""
+        if not self.current_user:
+            self.root.current = "login"
+            return
+        ids = self.cfm_screen.ids
+        case_type = ids.cfm_type.text.strip()
+        if not case_type or case_type == "Select complaint / feedback type":
+            ids.cfm_message.text = "Please select the Type of Complaint / Feedback."
+            return
+
+        description = ids.cfm_description.text.strip()
+        if not description and case_type.lower() not in ("appreciation/positive feedback",):
+            ids.cfm_message.text = "Please describe your complaint, concern, feedback, or suggestion before submitting."
+            return
+
+        anonymous = bool(ids.anonymous_yes.active)
+        sex = self._cfm_checked_value(ids, (
+            ("sex_male", "Male"), ("sex_female", "Female"), ("sex_prefer", "Prefer not to say")
+        ), "Prefer not to say")
+        location_level = self._cfm_checked_value(ids, (
+            ("loc_community", "Community"), ("loc_field_office", "Field Office"),
+            ("loc_head_office", "Head Office"), ("loc_other", "Other")
+        ), "Community")
+        if location_level == "Other" and ids.cfm_location_other.text.strip():
+            location_level = ids.cfm_location_other.text.strip()
+
+        preferred_contact = self._cfm_checked_value(ids, (
+            ("pref_phone", "Phone"), ("pref_sms", "SMS"), ("pref_whatsapp", "WhatsApp"),
+            ("pref_person", "In person"), ("pref_other", "Other")
+        ), "Phone")
+        if preferred_contact == "Other" and ids.cfm_contact_other.text.strip():
+            preferred_contact = ids.cfm_contact_other.text.strip()
+
+        category = ids.cfm_type_other.text.strip() if case_type == "Other" and ids.cfm_type_other.text.strip() else case_type
+        referral_required = bool(ids.referral_yes.active)
+        status = self._cfm_selected_status(ids)
+        # A newly submitted case starts as Open/Under Review. Final closure is
+        # completed from Staff Use after respondent confirmation, so the
+        # follow-up and closure sections cannot be skipped at initial submission.
+        if status == "Closed":
+            ids.cfm_message.text = (
+                "Submit the case as Open or Under Review first. Select Closed only "
+                "after respondent confirmation and complete sections 10 and 11, then SAVE STAFF UPDATE."
+            )
+            return
+        closed_date = ids.cfm_closed_date.text.strip()
+
+        email = str(self.current_user[20]) if len(self.current_user) > 20 else ""
+        fullname = str(self.current_user[1]) if len(self.current_user) > 1 else ""
+        data = {
+            "date_received": ids.cfm_date_received.text.strip() or self.cfm_today_date(),
+            "location_level": location_level,
+            "submission_method": self._cfm_selected_methods(ids),
+            "complainant_name": "" if anonymous else ids.cfm_name.text.strip(),
+            "complainant_phone": "" if anonymous else ids.cfm_phone.text.strip(),
+            "complainant_sex": "" if anonymous else sex,
+            "community_location": ids.cfm_community.text.strip(),
+            "anonymous": anonymous,
+            "preferred_contact": preferred_contact,
+            "case_type": case_type,
+            "category": category,
+            "description": description,
+            "incident_location": ids.cfm_incident_location.text.strip(),
+            "programme_project": ids.cfm_programme.text.strip(),
+            "incident_datetime": ids.cfm_incident_date.text.strip(),
+            "desired_solution": ids.cfm_solution.text.strip(),
+            "urgency": self._cfm_selected_urgency(ids),
+            "assigned_to": ids.cfm_assigned_to.text.strip(),
+            "target_response_date": ids.cfm_target_response_date.text.strip(),
+            "cfm_office_name": ids.cfm_office_name.text.strip(),
+            "noted": ids.cfm_noted.text.strip(),
+            "case_document": ids.cfm_case_document.text.strip(),
+            "review_by_management": ids.cfm_review_management.text.strip(),
+            "status": status,
+            "referral_required": referral_required,
+            "referral_person": ids.cfm_referral_person.text.strip(),
+            "action_taken": ids.cfm_action_taken.text.strip(),
+            "response_date": ids.cfm_response_date.text.strip(),
+            "complainant_informed": bool(ids.informed_yes.active),
+            "complainant_satisfied": self._cfm_checked_value(ids, (
+                ("satisfied_yes", "Yes"), ("satisfied_no", "No"), ("satisfied_na", "Not available")
+            ), "Not available"),
+            "further_action_required": bool(ids.further_yes.active),
+            "closed_date": closed_date,
+            "closed_by": ids.cfm_closed_by.text.strip(),
+            "remarks": ids.cfm_remarks.text.strip(),
+            "submitted_by_email": email,
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        if not ids.cfm_received_by.text.strip():
+            ids.cfm_received_by.text = fullname
+        data["assigned_to"] = ids.cfm_assigned_to.text.strip()
+        try:
+            reference = create_cfm_case(data)
+            # Push the complete case to the same CFM Google Sheet endpoint.
+            threading.Thread(target=self._sync_new_cfm_case_to_google, args=(reference, data), daemon=True).start()
+            ids.cfm_reference.text = f"Reference No.: {reference}"
+            ids.cfm_reference_input.text = reference
+            ids.cfm_staff_reference.text = reference
+            ids.cfm_staff_category.text = category
+            ids.cfm_received_by.text = ids.cfm_received_by.text.strip() or fullname
+            ids.cfm_message.text = f"Case submitted successfully. Keep this reference number for follow-up: {reference}"
+            self._clear_cfm_submission_fields()
+            self.refresh_cfm_cases()
+        except Exception as exc:
+            logger.exception("CFM case submission failed")
+            ids.cfm_message.text = f"Could not submit CFM case: {exc}"
+
+    def _cfm_endpoint(self):
+        return str(self._excel_sync_state.get("cfm_endpoint") or "").strip()
+
+    def _post_cfm_remote(self, action, payload):
+        endpoint = self._cfm_endpoint()
+        if not endpoint:
+            return False, "CFM automatic upload endpoint is not configured."
+        body = dict(payload or {})
+        body["action"] = action
+        body["source"] = "ROHI Attendance APK"
+        try:
+            raw = json.dumps(body).encode("utf-8")
+            req = Request(endpoint, data=raw, method="POST")
+            req.add_header("Content-Type", "application/json")
+            req.add_header("User-Agent", "ROHI-Attendance-App/1.7")
+            with urlopen(req, timeout=20, context=ROHI_SSL_CONTEXT) as response:
+                text = response.read().decode("utf-8", errors="replace")
+                status = getattr(response, "status", 200)
+            if not (200 <= status < 400):
+                return False, f"CFM server returned HTTP {status}."
+            try:
+                result = json.loads(text)
+            except Exception:
+                result = {"ok": True, "message": text[:300]}
+            return bool(result.get("ok", True)), str(result.get("message", "CFM server updated."))
+        except Exception as exc:
+            logger.exception("CFM remote request failed")
+            return False, str(exc)
+
+    def _sync_new_cfm_case_to_google(self, reference, data):
+        payload = dict(data or {})
+        payload["reference_no"] = reference
+        ok, message = self._post_cfm_remote("cfm_upsert", payload)
+        logger.info("CFM remote create [%s]: %s", reference, message)
+        return ok, message
+
+    def _sync_cfm_statuses_from_google(self):
+        """Pull Open/Under Review/Closed status changes from the central CFM sheet."""
+        endpoint = self._cfm_endpoint()
+        if not endpoint:
+            return
+        sheet_link = str(self._excel_sync_state.get("cfm_link") or "").strip()
+        def worker():
+            try:
+                query = endpoint + ("&" if "?" in endpoint else "?") + "action=cfm_statuses"
+                if sheet_link:
+                    from urllib.parse import quote
+                    query += "&sheet_link=" + quote(sheet_link, safe="")
+                req = Request(query, headers={"User-Agent": "ROHI-Attendance-App/1.7"}, method="GET")
+                with urlopen(req, timeout=20, context=ROHI_SSL_CONTEXT) as response:
+                    raw = response.read().decode("utf-8", errors="replace")
+                result = json.loads(raw)
+                if not result.get("ok"):
+                    logger.warning("CFM status sync failed: %s", result.get("message"))
+                    return
+                changed = 0
+                for item in result.get("cases", []):
+                    ref = str(item.get("reference_no") or "").strip()
+                    status = str(item.get("status") or "Open").strip()
+                    if not ref or status not in ("Open", "Under Review", "Closed"):
+                        continue
+                    changed += int(bool(sync_cfm_remote_status(
+                        ref, status,
+                        item.get("action_taken") or "",
+                        item.get("closed_date") or "",
+                        item.get("closed_by") or "",
+                        item.get("remarks") or "",
+                    )))
+                if changed:
+                    Clock.schedule_once(lambda dt: self.refresh_cfm_cases(), 0)
+            except Exception as exc:
+                logger.info("CFM status sync unavailable: %s", exc)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def save_cfm_staff_update(self):
+        """Save staff-use, follow-up and closure fields for an existing CFM case."""
+        ids = self.cfm_screen.ids
+        reference = ids.cfm_staff_reference.text.strip() or ids.cfm_reference_input.text.strip()
+        if not reference or reference == "Auto-generated on submission":
+            ids.cfm_message.text = "Enter or select a valid CFM Reference Number before saving staff updates."
+            return
+        status = self._cfm_selected_status(ids)
+        closed_date = ids.cfm_closed_date.text.strip()
+        if status == "Closed":
+            if not ids.cfm_response_date.text.strip():
+                ids.cfm_message.text = "Enter the response date before final closure."
+                return
+            if not ids.informed_yes.active:
+                ids.cfm_message.text = "Confirm that the complainant/respondent was informed before final closure."
+                return
+            if not (ids.satisfied_yes.active or ids.satisfied_no.active or ids.satisfied_na.active):
+                ids.cfm_message.text = "Record whether the complainant/respondent was satisfied before final closure."
+                return
+            if not closed_date:
+                closed_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                ids.cfm_closed_date.text = closed_date
+        data = {
+            "date_received": ids.cfm_staff_date_received.text.strip() or self.cfm_today_date(),
+            "assigned_to": ids.cfm_assigned_to.text.strip(),
+            "target_response_date": ids.cfm_target_response_date.text.strip(),
+            "cfm_office_name": ids.cfm_office_name.text.strip(),
+            "noted": ids.cfm_noted.text.strip(),
+            "case_document": ids.cfm_case_document.text.strip(),
+            "review_by_management": ids.cfm_review_management.text.strip(),
+            "status": status,
+            "referral_required": bool(ids.referral_yes.active),
+            "referral_person": ids.cfm_referral_person.text.strip(),
+            "action_taken": ids.cfm_action_taken.text.strip(),
+            "response_date": ids.cfm_response_date.text.strip(),
+            "complainant_informed": bool(ids.informed_yes.active),
+            "complainant_satisfied": self._cfm_checked_value(ids, (
+                ("satisfied_yes", "Yes"), ("satisfied_no", "No"), ("satisfied_na", "Not available")
+            ), "Not available"),
+            "further_action_required": bool(ids.further_yes.active),
+            "closed_date": closed_date,
+            "closed_by": ids.cfm_closed_by.text.strip(),
+            "remarks": ids.cfm_remarks.text.strip(),
+        }
+        try:
+            changed = update_cfm_case_details(reference, data)
+            if changed:
+                threading.Thread(target=self._post_cfm_remote, args=("cfm_update", dict(data, reference_no=reference)), daemon=True).start()
+            ids.cfm_message.text = "Staff update saved successfully." if changed else "CFM Reference Number was not found."
+            self.refresh_cfm_cases()
+        except Exception as exc:
+            logger.exception("Unable to save CFM staff update")
+            ids.cfm_message.text = f"Could not save staff update: {exc}"
+
+    def _clear_cfm_submission_fields(self):
+        """Reset complainant-facing fields after a successful submission."""
+        ids = self.cfm_screen.ids
+        for field_id in ("cfm_name", "cfm_phone", "cfm_community", "cfm_location_other", "cfm_method_other",
+                         "cfm_contact_other", "cfm_type_other", "cfm_incident_date", "cfm_incident_location",
+                         "cfm_programme", "cfm_description", "cfm_solution", "cfm_office_name",
+                         "cfm_noted"):
+            getattr(ids, field_id).text = ""
+        ids.cfm_type.text = "Select complaint / feedback type"
+        ids.cfm_case_document.text = ""
+        ids.cfm_review_management.text = ""
+        for widget_id in (
+            "anonymous_yes", "anonymous_no",
+            "sex_male", "sex_female", "sex_prefer",
+            "pref_phone", "pref_sms", "pref_whatsapp", "pref_person", "pref_other",
+            "loc_community", "loc_field_office", "loc_head_office", "loc_other",
+            "method_suggestion", "method_person", "method_phone", "method_whatsapp",
+            "method_email", "method_staff", "method_meeting", "method_other",
+            "urgency_normal", "urgency_urgent", "urgency_confidential", "urgency_immediate",
+            "status_open", "status_review", "status_closed",
+            "referral_yes", "referral_no",
+            "informed_yes", "informed_no",
+            "satisfied_yes", "satisfied_no", "satisfied_na",
+            "further_yes", "further_no",
+        ):
+            if hasattr(ids, widget_id):
+                getattr(ids, widget_id).active = False
+        today = self.cfm_today_date()
+        ids.cfm_date_received.text = today
+        ids.cfm_staff_date_received.text = today
+
+    def refresh_cfm_cases(self):
+        """Refresh CFM total/open/closed counts and a privacy-conscious case list."""
+        try:
+            ids = self.cfm_screen.ids
+            counts = get_cfm_counts()
+            ids.cfm_total_count.text = str(counts.get("Total", 0))
+            ids.cfm_open_count.text = str(counts.get("Open", 0))
+            ids.cfm_review_count.text = str(counts.get("Under Review", 0))
+            ids.cfm_closed_count.text = str(counts.get("Closed", 0))
+            try:
+                dash_ids = self.dashboard_screen.ids
+                dash_ids.cfm_total_count.text = str(counts.get("Total", 0))
+                dash_ids.cfm_open_count.text = str(counts.get("Open", 0))
+                dash_ids.cfm_review_count.text = str(counts.get("Under Review", 0))
+                dash_ids.cfm_closed_count.text = str(counts.get("Closed", 0))
+            except Exception:
+                pass
+            rows = get_cfm_cases(50)
+            if not rows:
+                ids.cfm_case_list.text = "No CFM cases yet."
+                return
+            lines = ["Recent CFM cases (personal details are not displayed here):"]
+            for row in rows:
+                ref = row[1] or "-"
+                date = row[2] or "-"
+                level = row[3] or "-"
+                ctype = row[4] or "-"
+                category = row[5] or "-"
+                urgency = row[6] or "Normal"
+                status = row[7] or "Open"
+                lines.append(f"{ref} | {date} | {level} | {ctype} | {category} | {urgency} | {status}")
+            ids.cfm_case_list.text = "\n".join(lines)
+        except Exception:
+            logger.exception("Unable to refresh CFM cases")
+
+    def close_cfm_case(self):
+        """Close a selected CFM case by reference number."""
+        ids = self.cfm_screen.ids
+        reference = ids.cfm_manage_reference.text.strip()
+        closed_by = ids.cfm_manage_closed_by.text.strip()
+        if not reference:
+            ids.cfm_message.text = "Enter the CFM Reference No. of the case you want to close."
+            return
+        if not closed_by:
+            ids.cfm_message.text = "Enter the name of the person closing the case."
+            return
+        try:
+            changed = update_cfm_case_status(reference, "Closed", "Case closed through CFM case management.", closed_by)
+            if changed:
+                threading.Thread(target=self._post_cfm_remote, args=("cfm_update", {
+                    "reference_no": reference,
+                    "status": "Closed",
+                    "action_taken": "Case closed through CFM case management.",
+                    "closed_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "closed_by": closed_by,
+                }), daemon=True).start()
+            if changed:
+                ids.cfm_message.text = f"CFM case {reference} was closed successfully."
+                ids.cfm_manage_reference.text = ""
+                ids.cfm_manage_closed_by.text = ""
+                ids.cfm_staff_reference.text = reference
+                ids.status_closed.active = True
+                ids.cfm_closed_date.text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                ids.cfm_closed_by.text = closed_by
+                self.refresh_cfm_cases()
+            else:
+                ids.cfm_message.text = f"CFM case {reference} was not found."
+        except Exception as exc:
+            logger.exception("Unable to close CFM case")
+            ids.cfm_message.text = f"Could not close CFM case: {exc}"
+
+    # -----------------------------
+    # Leave Management
+    # -----------------------------
+    LEAVE_DEFAULT_BALANCES = {
+        "Annual Leave": 20,
+        "Sick Leave": 10,
+        "Maternity Leave": 84,
+        "Paternity Leave": 14,
+        "Compassionate Leave": 5,
+        "Other Leave": 5,
+    }
+
+    def open_leave(self):
+        """Open Leave Management and refresh the current staff's balance/history."""
+        if not self.current_user:
+            self.root.current = "login"
+            return
+        self.root.current = "leave"
+        ids = self.leave_screen.ids
+        fullname = str(self.current_user[1]) if len(self.current_user) > 1 and self.current_user[1] else "-"
+        position = str(self.current_user[17]) if len(self.current_user) > 17 and self.current_user[17] else "-"
+        email = str(self.current_user[20]) if len(self.current_user) > 20 and self.current_user[20] else ""
+        ids.leave_staff.text = f"Staff: {fullname}"
+        ids.leave_position.text = f"Position: {position}"
+        now = datetime.now()
+        if not ids.leave_start.text:
+            ids.leave_start.text = now.strftime("%Y-%m-%d")
+        if not ids.leave_end.text:
+            ids.leave_end.text = now.strftime("%Y-%m-%d")
+        self._refresh_leave_summary(email)
+
+    def _refresh_leave_summary(self, email=None):
+        try:
+            if not email and self.current_user and len(self.current_user) > 20:
+                email = str(self.current_user[20])
+            year = datetime.now().year
+            used = {
+                leave_type: get_leave_usage(email, leave_type, year)
+                for leave_type in self.LEAVE_DEFAULT_BALANCES
+            }
+            ids = self.leave_screen.ids
+            ids.annual_balance.text = f"{max(0, self.LEAVE_DEFAULT_BALANCES['Annual Leave'] - used['Annual Leave'])} days"
+            ids.sick_balance.text = f"{max(0, self.LEAVE_DEFAULT_BALANCES['Sick Leave'] - used['Sick Leave'])} days"
+            ids.maternity_balance.text = f"{max(0, self.LEAVE_DEFAULT_BALANCES['Maternity Leave'] - used['Maternity Leave'])} days"
+            ids.paternity_balance.text = f"{max(0, self.LEAVE_DEFAULT_BALANCES['Paternity Leave'] - used['Paternity Leave'])} days"
+            ids.compassionate_balance.text = f"{max(0, self.LEAVE_DEFAULT_BALANCES['Compassionate Leave'] - used['Compassionate Leave'])} days"
+            ids.other_balance.text = f"{max(0, self.LEAVE_DEFAULT_BALANCES['Other Leave'] - used['Other Leave'])} days"
+            rows = get_leave_requests(email)
+            counts = get_leave_status_counts(email)
+            ids.pending_count.text = str(counts.get("Pending", 0))
+            ids.approved_count.text = str(counts.get("Approved", 0))
+            ids.rejected_count.text = str(counts.get("Rejected", 0))
+            try:
+                dash_ids = self.dashboard_screen.ids
+                dash_ids.leave_pending_count.text = str(counts.get("Pending", 0))
+                dash_ids.leave_approved_count.text = str(counts.get("Approved", 0))
+                dash_ids.leave_rejected_count.text = str(counts.get("Rejected", 0))
+            except Exception:
+                pass
+            if not rows:
+                ids.leave_history.text = "No leave requests yet."
+                return
+            lines = []
+            for row in rows:
+                # id, type, start, end, days, reason, status, manager_comment, submitted_at
+                status = row[6] or "Pending"
+                comment = f" — {row[7]}" if row[7] else ""
+                lines.append(f"{row[1]} | {row[2]} to {row[3]} | {row[4]} day(s) | {status}{comment}")
+            ids.leave_history.text = "\n".join(lines)
+        except Exception:
+            logger.exception("Unable to refresh leave summary")
+
+    def submit_leave_request(self):
+        """Validate and save a leave request as Pending."""
+        if not self.current_user:
+            return
+        ids = self.leave_screen.ids
+        leave_type = ids.leave_type_spinner.text.strip()
+        start_text = ids.leave_start.text.strip()
+        end_text = ids.leave_end.text.strip()
+        reason = ids.leave_reason.text.strip()
+
+        try:
+            start = datetime.strptime(start_text, "%Y-%m-%d")
+            end = datetime.strptime(end_text, "%Y-%m-%d")
+        except ValueError:
+            ids.leave_message.text = "Enter dates as YYYY-MM-DD."
+            return
+
+        if end < start:
+            ids.leave_message.text = "End date cannot be before start date."
+            return
+        if start.date() < datetime.now().date():
+            ids.leave_message.text = "Leave start date cannot be in the past."
+            return
+        days = (end.date() - start.date()).days + 1
+        email = str(self.current_user[20]) if len(self.current_user) > 20 else ""
+        fullname = str(self.current_user[1]) if len(self.current_user) > 1 else ""
+
+        # Prevent submitting beyond the configured balance for leave types with a balance.
+        limits = self.LEAVE_DEFAULT_BALANCES
+        if leave_type in limits:
+            used = get_leave_usage(email, leave_type, start.year)
+            remaining = max(0, limits[leave_type] - used)
+            if days > remaining:
+                ids.leave_message.text = f"Insufficient {leave_type} balance. Remaining: {remaining} day(s)."
+                return
+
+        try:
+            create_leave_request({
+                "staff_email": email,
+                "staff_name": fullname,
+                "leave_type": leave_type,
+                "start_date": start.strftime("%Y-%m-%d"),
+                "end_date": end.strftime("%Y-%m-%d"),
+                "days": days,
+                "reason": reason,
+                "submitted_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
+            ids.leave_message.text = "Leave request submitted successfully. Status: Pending."
+            ids.leave_reason.text = ""
+            self._refresh_leave_summary(email)
+        except Exception as exc:
+            logger.exception("Leave request submission failed")
+            ids.leave_message.text = f"Could not submit request: {exc}"
+
+    def export_leave_excel(self, directory=None, silent=False):
+        """Export the logged-in staff member's leave history and balances to Excel.
+
+        ``directory`` lets a caller build the workbook somewhere other than
+        the visible phone Downloads folder. ``silent`` skips updating the
+        on-screen export status and the auto-sync queue — used when this is
+        only building a temporary file for "Send to Google", not a real
+        export the user asked to keep."""
+        try:
+            if not self.current_user:
+                return None
+            email = str(self.current_user[20]) if len(self.current_user) > 20 else ""
+            rows = get_leave_requests(email)
+            headers = [
+                "Leave Type", "Start Date", "End Date", "Days", "Reason",
+                "Status", "Manager Comment", "Submitted At"
+            ]
+            data_rows = []
+            for row in rows:
+                # id, type, start, end, days, reason, status, manager_comment, submitted_at
+                data_rows.append([
+                    row[1] or "-", row[2] or "-", row[3] or "-", row[4] or 0,
+                    row[5] or "-", row[6] or "Pending", row[7] or "-", row[8] or "-"
+                ])
+
+            # Keep a useful row even when the staff member has not requested leave yet.
+            if not data_rows:
+                data_rows.append(["No leave requests", "-", "-", 0, "-", "-", "-", "-"])
+
+            reports_dir = directory or self._get_download_dir()
+            fullname = str(self.current_user[1]) if len(self.current_user) > 1 else "Staff"
+            name_parts = fullname.strip().split()
+            short_name = ((name_parts[0][0].upper() + " " + name_parts[-1])
+                          if len(name_parts) >= 2 else (name_parts[0] if name_parts else "Staff"))
+            state_office = str(self.current_user[13]) if len(self.current_user) > 13 and self.current_user[13] else "Unassigned"
+            office_short = re.sub(r"\s+(State Office|HQ)$", "", state_office, flags=re.I).strip() or "Unassigned"
+            period = datetime.now().strftime("%m-%Y")
+            filepath = os.path.join(reports_dir, f"{short_name} {period} {office_short} Leave.xlsx")
+            self._build_excel(
+                filepath, headers, data_rows,
+                sheet_title="Leave Management", password=REPORT_EXPORT_PASSWORD
+            )
+            if silent:
+                return filepath
+            self._last_export_path = filepath
+            self._queue_excel_auto_sync(filepath, "leave")
+            if hasattr(self.leave_screen.ids, 'leave_message'):
+                self.leave_screen.ids.leave_message.text = f"Leave report exported: {os.path.basename(filepath)}"
+            logger.info("Leave report exported to %s", filepath)
+            return filepath
+        except Exception as exc:
+            logger.exception("Error exporting leave report")
+            if not silent and hasattr(self.leave_screen.ids, 'leave_message'):
+                self.leave_screen.ids.leave_message.text = f"Could not export leave report: {exc}"
+            return None
+
+    # -----------------------------
+    # Excel auto-sync connections and schedules
+    # -----------------------------
+    def _post_rohi_json(self, endpoint, payload, timeout=30):
+        """POST structured ROHI data to an Apps Script/HTTP endpoint."""
+        endpoint = str(endpoint or "").strip()
+        if not endpoint:
+            return False, "No automatic upload endpoint configured."
+        try:
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            req = Request(endpoint, data=body, method="POST")
+            req.add_header("Content-Type", "application/json; charset=utf-8")
+            req.add_header("User-Agent", "ROHI-Attendance-App/2.0")
+            with urlopen(req, timeout=timeout, context=ROHI_SSL_CONTEXT) as response:
+                status = getattr(response, "status", 200)
+                raw = response.read(8192).decode("utf-8", errors="replace")
+            if status < 200 or status >= 300:
+                return False, f"Server returned HTTP {status}."
+            try:
+                result = json.loads(raw) if raw else {}
+            except Exception:
+                result = {}
+            if isinstance(result, dict) and result.get("ok") is False:
+                return False, str(result.get("message") or "Server rejected the submission.")
+            return True, str(result.get("message") if isinstance(result, dict) and result.get("message") else "Submitted successfully.")
+        except HTTPError as exc:
+            return False, f"Server submission failed (HTTP {exc.code})."
+        except URLError:
+            return False, "No internet connection. The submission will remain available for retry."
+        except Exception as exc:
+            logger.exception("ROHI JSON submission failed:")
+            return False, f"Server submission failed: {exc}"
+
+    def _submit_attendance_to_endpoint(self, check_in="", check_out="", checkin_gps="", checkout_gps=""):
+        """Submit the current attendance row directly to the configured ROHI
+        Attendance Apps Script endpoint. This is the Kobo-style data path:
+        send row data, do not generate/upload an Excel file for every punch."""
+        endpoint = str(self._excel_sync_state.get("attendance_endpoint") or "").strip()
+        if not endpoint or not self.current_user:
+            return False, "Attendance automatic endpoint is not configured."
+
+        user = self.current_user
+        payload = {
+            "action": "attendance_submit",
+            "staff_id": str(user[18] if len(user) > 18 else ""),
+            "unique_id": str(user[29] if len(user) > 29 else ""),
+            "name": str(user[1] if len(user) > 1 else ""),
+            "sex": str(user[2] if len(user) > 2 else ""),
+            "position": str(user[17] if len(user) > 17 else ""),
+            "state_office": str(user[13] if len(user) > 13 else ""),
+            "cluster": str(user[14] if len(user) > 14 else ""),
+            "office_gps": str(user[26] if len(user) > 26 else self.static_gps),
+            "date": datetime.now().strftime("%Y-%m-%d"),
+            "check_in": check_in or "",
+            "check_out": check_out or "",
+            "checkin_gps": checkin_gps or "",
+            "checkout_gps": checkout_gps or "",
+            "current_state_office": str(getattr(self, "_last_current_state_office", "") or ""),
+            "late_hour": str(getattr(self, "late_duration_str", "") or "On Time"),
+            "attendance_status": str(
+                "Present but Late" if getattr(self, "late_duration_str", "On Time") != "On Time"
+                else "Present (On Time)"
+            ),
+        }
+        return self._post_rohi_json(endpoint, payload, timeout=30)
+
+    def _submit_staff_registration_to_endpoint(self, staff_data):
+        """Immediately submit registration/profile data to the configured
+        staff endpoint. This updates the Google Sheet directly; it is not an
+        email action and does not require a Google account chooser."""
+        endpoint = str(self._excel_sync_state.get("staff_endpoint") or "").strip()
+        if not endpoint:
+            return False, "Staff automatic endpoint is not configured."
+        safe_data = dict(staff_data or {})
+        # Never transmit the local password to the Google Sheet.
+        safe_data.pop("password", None)
+        safe_data["action"] = "staff_registration"
+        safe_data["submitted_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return self._post_rohi_json(endpoint, safe_data, timeout=30)
+
+    def _submit_staff_registration_immediately(self, staff_data):
+        """Run immediate staff registration sync in the background."""
+        def worker():
+            ok, message = self._submit_staff_registration_to_endpoint(staff_data)
+            if ok:
+                self._set_staff_registration_sync_status(
+                    "Registration submitted to Google successfully.", True
+                )
+                return
+            # Keep the existing workbook upload as a fallback when a file
+            # endpoint is deliberately configured. Do not open Google or ask
+            # the user to select an account.
+            try:
+                path = self._export_staff_template(for_sync=True)
+                self._send_excel_now(path, "staff", self._set_staff_registration_sync_status)
+            except Exception:
+                logger.exception("Staff registration fallback export failed.")
+                self._set_staff_registration_sync_status(message, False)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _send_excel_now(self, filepath, report_type, status_callback=None, cleanup_path=None):
+        """Send a generated workbook immediately.
+
+        If an actual HTTP/Apps-Script upload endpoint is configured, the XLSX
+        is uploaded in the background. If only a Google Sheets/Drive link is
+        configured, that link is opened instead of incorrectly reporting
+        "Not Connected". A share/folder URL cannot itself receive an XLSX POST,
+        so the UI clearly tells the user that an upload endpoint is still needed
+        for true unattended file transfer.
+
+        ``cleanup_path``, when given, is deleted once the upload attempt
+        finishes (used for the private temp file built just for "Send to
+        Google" so nothing is left behind on the phone).
+        """
+        if not filepath or not os.path.exists(filepath):
+            message = "Generate the Excel file first."
+            if status_callback:
+                Clock.schedule_once(lambda dt: status_callback(message, False), 0)
+            return False
+
+        endpoint = str(self._excel_sync_state.get(f"{report_type}_endpoint") or "").strip()
+
+        # A Google Drive/Sheets view link is never treated as an upload API.
+        # "Send to Google" must either upload through the configured Apps Script
+        # endpoint or clearly report that the one-time endpoint configuration is
+        # still missing. It must not open a browser or turn a link test into a
+        # false upload success.
+        if not endpoint:
+            message = (
+                f"{report_type.title()} Google upload is not configured yet. "
+                "Paste the deployed ROHI Apps Script /exec URL into the "
+                f"{report_type.title()} automatic upload endpoint in Server Connection."
+            )
+            if status_callback:
+                Clock.schedule_once(lambda dt: status_callback(message, False), 0)
+            if cleanup_path:
+                self._cleanup_temp_sync_file(cleanup_path)
+            return False
+
+        def worker():
+            state_office = str(self.current_user[13]) if self.current_user and len(self.current_user) > 13 else ""
+            ok, message = _http_upload_excel(filepath, endpoint, report_type, state_office=state_office)
+            if ok:
+                self._excel_sync_state[f"last_{report_type}_sync"] = datetime.now().isoformat(timespec="seconds")
+                _save_excel_sync_config(self._excel_sync_state)
+            if status_callback:
+                Clock.schedule_once(lambda dt: status_callback(message, ok), 0)
+            if cleanup_path:
+                self._cleanup_temp_sync_file(cleanup_path)
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
+    @mainthread
+    def _set_report_send_status(self, message, ok=True):
+        try:
+            if hasattr(self.reports_screen.ids, "report_status_label"):
+                self.reports_screen.ids.report_status_label.text = message
+                self.reports_screen.ids.report_status_label.text_color = (0.13, 0.40, 0.16, 1) if ok else (0.8, 0.1, 0.1, 1)
+        except Exception:
+            pass
+
+    def _build_selected_report_for_sync(self):
+        """Build the currently-selected report type (Attendance - Selected
+        Period / Full History / Staff Registration) straight into a private
+        temp folder, without ever touching the visible Downloads folder or
+        the on-screen export status. Used only by "Send to Google" so it can
+        send immediately without the user pressing "Generate Report" first."""
+        if not self.current_user:
+            return None
+        ids = self.reports_screen.ids
+        label = ids.report_type_field.text.strip() if hasattr(ids, 'report_type_field') else ""
+        type_map = dict(self.REPORT_TYPE_OPTIONS)
+        report_type = type_map.get(label) or "attendance"
+
+        temp_dir = self._get_temp_sync_dir()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fullname_safe = str(self.current_user[1]).replace(" ", "_") if len(self.current_user) > 1 else "staff"
+
+        if report_type == "staff_registration":
+            # No temp-only variant exists for the staff template export; it
+            # always writes its own filename, so build straight into temp_dir.
+            filepath = os.path.join(temp_dir, f"ROHI_Staff_on_IMS_{timestamp}.xlsx")
+            self._copy_template("Rohi_Staff on IMS.xlsx", filepath)
+            wb = openpyxl.load_workbook(filepath)
+            ws = wb.active
+            headers, data_rows = self._staff_registration_headers_and_rows()
+            template_headers = [ws.cell(3, c).value for c in range(1, ws.max_column + 1)]
+            index_map = {str(h).strip().lower(): i for i, h in enumerate(headers)}
+            for r in range(4, ws.max_row + 1):
+                for c in range(1, ws.max_column + 1):
+                    ws.cell(r, c).value = None
+            from copy import copy as _copy
+            template_row_height = ws.row_dimensions[4].height
+            template_styles = {c: _copy(ws.cell(4, c)._style) for c in range(1, ws.max_column + 1)}
+            template_alignment = {c: _copy(ws.cell(4, c).alignment) for c in range(1, ws.max_column + 1)}
+            template_number_formats = {c: ws.cell(4, c).number_format for c in range(1, ws.max_column + 1)}
+            for r_idx, row in enumerate(data_rows, start=4):
+                if r_idx > ws.max_row:
+                    ws.insert_rows(r_idx)
+                if template_row_height is not None:
+                    ws.row_dimensions[r_idx].height = template_row_height
+                for c_idx, h in enumerate(template_headers, start=1):
+                    cell = ws.cell(r_idx, c_idx)
+                    if r_idx > 4:
+                        cell._style = _copy(template_styles.get(c_idx))
+                        cell.alignment = _copy(template_alignment.get(c_idx))
+                        cell.number_format = template_number_formats.get(c_idx, "General")
+                    pos = index_map.get(str(h).strip().lower())
+                    cell.value = row[pos] if pos is not None and pos < len(row) else "-"
+            wb.save(filepath)
+            try:
+                self._encrypt_xlsx_open_password(filepath, REPORT_EXPORT_PASSWORD)
+            except Exception:
+                logger.exception("Could not password-protect staff template export.")
+            return filepath
+        elif report_type == "attendance_history":
+            email_val = str(self.current_user[20]) if len(self.current_user) > 20 else ""
+            rows = self._fetch_attendance_records(email_val)
+            return self._export_attendance_template(rows, title_suffix="Full_History", directory=temp_dir)
+        else:  # "attendance" - currently selected report period
+            rows = getattr(self, '_last_report_rows', [])
+            return self._export_attendance_template(rows, title_suffix="Selected", directory=temp_dir)
+
+    def send_attendance_report_to_excel(self):
+        """Send a fresh attendance workbook straight to Google.
+
+        This does not require "Generate Report" to be pressed first, and it
+        does not run the export flow in the background either — it builds
+        the workbook privately just for this upload, sends it, then removes
+        the temp file. "Generate Report" still works exactly as before for
+        anyone who wants the file saved to their phone.
+        """
+        try:
+            path = self._build_selected_report_for_sync()
+        except Exception:
+            logger.exception("Could not build attendance report for Send to Google.")
+            path = None
+        if not path or not os.path.exists(path):
+            self._set_report_send_status("Could not build the report to send.", False)
+            return
+        self._send_excel_now(path, "attendance", self._set_report_send_status, cleanup_path=path)
+
+    @mainthread
+    def _set_timesheet_send_status(self, message, ok=True):
+        try:
+            if hasattr(self.timesheet_screen.ids, "timesheet_status_label"):
+                self.timesheet_screen.ids.timesheet_status_label.text = message
+                self.timesheet_screen.ids.timesheet_status_label.text_color = (0.13, 0.40, 0.16, 1) if ok else (0.8, 0.1, 0.1, 1)
+        except Exception:
+            pass
+
+    def send_timesheet_to_excel(self):
+        """Send a fresh timesheet workbook straight to Google.
+
+        This does not require "Export Timesheet (Excel)" to be pressed
+        first, and it does not run the export flow in the background
+        either — it builds the workbook privately just for this upload,
+        sends it, then removes the temp file. The export button still
+        works exactly as before for anyone who wants the file saved to
+        their phone.
+        """
+        try:
+            path = self._export_timesheet_template(directory=self._get_temp_sync_dir())
+        except Exception:
+            logger.exception("Could not build timesheet for Send to Google.")
+            path = None
+        if not path or not os.path.exists(path):
+            self._set_timesheet_send_status("Could not build the timesheet to send.", False)
+            return
+        self._send_excel_now(path, "timesheet", self._set_timesheet_send_status, cleanup_path=path)
+
+    @mainthread
+    def _set_leave_send_status(self, message, ok=True):
+        try:
+            if hasattr(self.leave_screen.ids, "leave_message"):
+                self.leave_screen.ids.leave_message.text = message
+                self.leave_screen.ids.leave_message.text_color = (0.13, 0.40, 0.16, 1) if ok else (0.8, 0.1, 0.1, 1)
+        except Exception:
+            pass
+
+    def send_leave_to_excel(self):
+        """Send a fresh leave report workbook straight to Google.
+
+        This does not require "Export Leave Report (Excel)" to be pressed
+        first, and it does not run the export flow in the background
+        either — it builds the workbook privately just for this upload,
+        sends it, then removes the temp file. The export button still
+        works exactly as before for anyone who wants the file saved to
+        their phone.
+        """
+        try:
+            path = self.export_leave_excel(directory=self._get_temp_sync_dir(), silent=True)
+        except Exception:
+            logger.exception("Could not build leave report for Send to Google.")
+            path = None
+        if not path or not os.path.exists(path):
+            self._set_leave_send_status("Could not build the leave report to send.", False)
+            return
+        self._send_excel_now(path, "leave", self._set_leave_send_status, cleanup_path=path)
+
+    def _queue_excel_auto_sync(self, filepath, report_type):
+        """Send an exported workbook to the configured server endpoint without
+        blocking the UI. A plain Google Drive/Sheets share URL is only a link;
+        actual upload requires an HTTP upload endpoint."""
+        endpoint = str(self._excel_sync_state.get(f"{report_type}_endpoint") or "").strip()
+        if not endpoint:
+            return
+        if not os.path.exists(filepath):
+            return
+
+        def worker():
+            if not self._excel_sync_lock.acquire(blocking=False):
+                logger.info("Excel sync already running; leaving current export on disk.")
+                return
+            try:
+                state_office = str(self.current_user[13]) if self.current_user and len(self.current_user) > 13 else ""
+                ok, message = _http_upload_excel(filepath, endpoint, report_type, state_office=state_office)
+                logger.info("Excel auto-sync [%s] [%s]: %s", report_type, state_office, message)
+                if ok:
+                    key = f"last_{report_type}_sync"
+                    self._excel_sync_state[key] = datetime.now().isoformat(timespec="seconds")
+                    _save_excel_sync_config(self._excel_sync_state)
+            finally:
+                self._excel_sync_lock.release()
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _generate_and_push_staff_immediately(self, staff_data=None):
+        """Immediately synchronize registration/profile data.
+
+        The primary path is structured data -> Apps Script -> Google Sheet.
+        The XLSX export remains only as a fallback when a file upload endpoint
+        is configured. No Google account chooser is opened.
+        """
+        if staff_data:
+            self._submit_staff_registration_immediately(staff_data)
+            return None
+        try:
+            if self.current_user:
+                data = self._staff_data_from_current_user()
+                self._submit_staff_registration_immediately(data)
+                return None
+        except Exception:
+            logger.exception("Immediate staff registration sync failed.")
+        return None
+
+    @mainthread
+    def _set_staff_registration_sync_status(self, message, ok=True):
+        logger.info("Staff registration sync status: %s", message)
+        # Registration screen may have a status label in newer layouts. Keep
+        # this optional so older layouts continue to work.
+        try:
+            ids = self.registration_screen.ids
+            if "registration_sync_status" in ids:
+                ids.registration_sync_status.text = message
+                ids.registration_sync_status.text_color = (0.13, 0.40, 0.16, 1) if ok else (0.8, 0.1, 0.1, 1)
+        except Exception:
+            pass
+
+    def _staff_data_from_current_user(self):
+        """Build the non-secret registration payload from the current local record."""
+        u = self.current_user or []
+        def v(index):
+            return str(u[index]) if len(u) > index and u[index] is not None else ""
+        return {
+            "fullname": v(1), "sex": v(2), "dob": v(3), "blood_group": v(4),
+            "marital_status": v(5), "nationality": v(6), "state_origin": v(7),
+            "lga": v(8), "address": v(9), "next_of_kin": v(10),
+            "next_of_kin_phone": v(11), "employment_type": v(12),
+            "state_office": v(13), "cluster": v(14), "department": v(15),
+            "section": v(16), "position": v(17), "staff_number": v(18),
+            "phone": v(19), "email": v(20), "facebook": v(21), "twitter": v(22),
+            "instagram": v(23), "telegram": v(24), "linkedin": v(25),
+            "gps_coordinate": v(26), "photo": v(27), "genotype": v(31),
+            "reintegration_status": v(32), "unique_id": v(29),
+        }
+
+    def _generate_staff_excel_for_sync(self):
+        try:
+            path = self._export_staff_template(for_sync=True)
+            self._queue_excel_auto_sync(path, "staff")
+            self._last_staff_excel_sync_at = datetime.now().isoformat(timespec="seconds")
+            self._excel_sync_state["last_staff_sync"] = self._last_staff_excel_sync_at
+            _save_excel_sync_config(self._excel_sync_state)
+            return path
+        except Exception:
+            logger.exception("24-hour staff Excel sync failed.")
+            return None
+        finally:
+            self._excel_staff_schedule_running = False
+
+    def _generate_timesheet_excel_for_sync(self):
+        try:
+            if not self.current_user:
+                return None
+            # _last_timesheet_rows is maintained by generate_timesheet() on the
+            # UI thread. Exporting the workbook itself is safe in this worker.
+            if not getattr(self, "_last_timesheet_rows", None):
+                return None
+            path = self._export_timesheet_template(for_sync=True)
+            self._queue_excel_auto_sync(path, "timesheet")
+            self._last_timesheet_excel_sync_at = datetime.now().isoformat(timespec="seconds")
+            self._excel_sync_state["last_timesheet_sync"] = self._last_timesheet_excel_sync_at
+            _save_excel_sync_config(self._excel_sync_state)
+            return path
+        except Exception:
+            logger.exception("One-minute timesheet Excel sync failed.")
+            return None
+        finally:
+            self._excel_timesheet_schedule_running = False
+
+    def _generate_attendance_excel_for_sync(self):
+        try:
+            now = datetime.now()
+            email = str(self.current_user[20]) if self.current_user and len(self.current_user) > 20 else ""
+            rows = self._fetch_attendance_records(email, now.year, now.month, "All Days (Monthly)")
+            today_rows = [r for r in rows if r[0] and r[0][:10] == now.strftime("%Y-%m-%d")]
+            path = self._export_attendance_template(today_rows, "Daily")
+            self._queue_excel_auto_sync(path, "attendance")
+            self._last_attendance_excel_sync_date = now.strftime("%Y-%m-%d")
+            self._excel_sync_state["last_attendance_sync"] = now.isoformat(timespec="seconds")
+            _save_excel_sync_config(self._excel_sync_state)
+            return path
+        except Exception:
+            logger.exception("5 PM attendance Excel sync failed.")
+            return None
+        finally:
+            self._excel_attendance_schedule_running = False
+
+    def _generate_leave_excel_for_sync(self):
+        """Generate and queue the logged-in user's leave workbook every 3 minutes."""
+        try:
+            path = self.export_leave_excel()
+            if path:
+                self._last_leave_excel_sync_at = datetime.now().isoformat(timespec="seconds")
+                self._excel_sync_state["last_leave_sync"] = self._last_leave_excel_sync_at
+                _save_excel_sync_config(self._excel_sync_state)
+        except Exception:
+            logger.exception("Three-minute leave Excel auto-sync failed.")
+        finally:
+            self._excel_leave_schedule_running = False
+
+    def push_all_reports_now(self):
+        """Immediately generate and queue all configured report workbooks.
+
+        The normal 3-minute auto-sync scheduler remains active. This button is
+        simply an on-demand push and never disables the scheduler.
+        """
+        if not self.current_user:
+            logger.warning("Immediate report push requested without an authenticated user.")
+            return
+        try:
+            if hasattr(self.dashboard_screen.ids, "push_reports_btn"):
+                self.dashboard_screen.ids.push_reports_btn.disabled = True
+                self.dashboard_screen.ids.push_reports_btn.icon = "cloud-sync"
+            if hasattr(self.dashboard_screen.ids, "push_reports_status"):
+                self.dashboard_screen.ids.push_reports_status.text = "Pushing reports..."
+        except Exception:
+            pass
+
+        def worker():
+            results = []
+            jobs = [
+                ("attendance", self._generate_attendance_excel_for_sync),
+                ("timesheet", self._generate_timesheet_excel_for_sync),
+                ("leave", self._generate_leave_excel_for_sync),
+                ("staff", self._generate_staff_excel_for_sync),
+            ]
+            for name, job in jobs:
+                try:
+                    path = job()
+                    results.append(f"{name}: {'queued' if path else 'skipped'}")
+                except Exception as exc:
+                    logger.exception("Immediate %s report push failed", name)
+                    results.append(f"{name}: failed")
+            message = "All reports pushed/queued. Auto-sync remains every 3 minutes."
+            Clock.schedule_once(lambda dt: self._finish_push_all_reports(message), 0)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @mainthread
+    def _finish_push_all_reports(self, message):
+        try:
+            if hasattr(self.dashboard_screen.ids, "push_reports_btn"):
+                self.dashboard_screen.ids.push_reports_btn.disabled = False
+                self.dashboard_screen.ids.push_reports_btn.icon = "cloud-upload"
+            if hasattr(self.dashboard_screen.ids, "push_reports_status"):
+                self.dashboard_screen.ids.push_reports_status.text = message
+        except Exception:
+            pass
+
+    def _excel_sync_schedule_tick(self):
+        """Run all Excel auto-sync jobs every 3 minutes while a user is logged in.
+
+        The 30-second scheduler tick only checks whether each 180-second job is due;
+        the actual Excel generation/upload runs in background threads so the UI stays responsive.
+        """
+        try:
+            if not self.current_user:
+                return
+            now = datetime.now()
+
+            def due(key, interval):
+                last = str(self._excel_sync_state.get(key) or "")
+                if not last:
+                    return True
+                try:
+                    return (now - datetime.fromisoformat(last)).total_seconds() >= interval
+                except Exception:
+                    return True
+
+            # Do not generate XLSX files automatically. Report files are created
+            # only when the user presses a report/export button. The existing
+            # Google/Apps Script attendance endpoint still receives check-in/out
+            # rows immediately, and the manual SEND TO GOOGLE EXCEL buttons keep
+            # their configured links/endpoints. This also prevents background
+            # workbook generation from destabilizing the Android session.
+            return
+        except Exception:
+            logger.exception("Excel sync scheduler tick failed.")
+
+    # -----------------------------
+    # Timesheet (Excel export + signature upload)
+    # -----------------------------
+    def open_timesheet(self):
+        self.root.current = "timesheet"
+        if not self.current_user:
+            return
+        ids = self.timesheet_screen.ids
+        fullname = str(self.current_user[1]) if len(self.current_user) > 1 and self.current_user[1] else "-"
+        position = str(self.current_user[17]) if len(self.current_user) > 17 and self.current_user[17] else "-"
+        if hasattr(ids, 'timesheet_name'):
+            ids.timesheet_name.text = f"Name: {fullname}"
+        if hasattr(ids, 'timesheet_position'):
+            ids.timesheet_position.text = f"Position: {position}"
+        now = datetime.now()
+        ids.timesheet_month_spinner.text = now.strftime("%B")
+        ids.timesheet_year_spinner.text = str(now.year)
+        self.generate_timesheet()
+
+    @staticmethod
+    def _pay_period_days(year, month):
+        """ROHI's payroll cycle runs 26th of the prior month through the 25th
+        of the given month (matches the official timesheet template), rather
+        than a plain calendar month."""
+        end_date = datetime(year, month, 25)
+        if month == 1:
+            start_date = datetime(year - 1, 12, 26)
+        else:
+            start_date = datetime(year, month - 1, 26)
+        days = []
+        d = start_date
+        while d <= end_date:
+            days.append(d)
+            d += timedelta(days=1)
+        return days
+
+    def _day_hours_worked(self, date_obj, record):
+        """Returns the Hours Worked cell value for one pay-period day:
+        WEEKEND / PUBLIC HOLIDAY labels, or fixed scheduled hours
+        (Monday-Thursday: 9, Friday WFH: 7)."""
+        date_key = date_obj.strftime("%Y-%m-%d")
+        if date_key in ROHI_PUBLIC_HOLIDAYS:
+            return "PUBLIC HOLIDAY"
+        if date_obj.weekday() >= 5:  # Saturday=5, Sunday=6
+            return "WEEKEND"
+
+        # Friday is Work From Home: always counts as a full scheduled
+        # 7-hour work day in the timesheet.
+        if date_obj.weekday() == 4:
+            return "4"
+
+        # Monday-Thursday: always a scheduled 8-hour work day.
+        return "8"
+
+    def generate_timesheet(self):
+        """Builds the daily timesheet grid (Pay Period Date | Day | Hours Worked)
+        for the selected pay period (26th of prior month - 25th of selected
+        month), matching the official ROHI timesheet template."""
+        try:
+            if not self.current_user:
+                return
+            ids = self.timesheet_screen.ids
+            email_val = str(self.current_user[20]) if len(self.current_user) > 20 else ""
+            month_name = ids.timesheet_month_spinner.text
+            year = int(ids.timesheet_year_spinner.text)
+            month = list(calendar.month_name).index(month_name)
+
+            period_days = self._pay_period_days(year, month)
+            start_d, end_d = period_days[0], period_days[-1]
+            rows = self._fetch_attendance_records(email_val, start_d.year, start_d.month, "All Days (Monthly)")
+            if start_d.month != end_d.month:
+                rows += self._fetch_attendance_records(email_val, end_d.year, end_d.month, "All Days (Monthly)")
+
+            by_date = {}
+            for check_in, check_out, late, status, gps, checkout_gps in rows:
+                if check_in:
+                    by_date[check_in[:10]] = (check_in, check_out, late, status)
+
+            container = ids.timesheet_rows_container
+            container.clear_widgets()
+            self._last_timesheet_rows = []
+            total_hours = 0.0
+
+            for date_obj in period_days:
+                date_key = date_obj.strftime("%Y-%m-%d")
+                day_name = date_obj.strftime("%A").upper()
+                record = by_date.get(date_key)
+                hours_cell = self._day_hours_worked(date_obj, record)
+                try:
+                    total_hours += float(hours_cell)
+                except ValueError:
+                    pass  # WEEKEND / PUBLIC HOLIDAY - not counted
+
+                row = MDBoxLayout(orientation='horizontal', spacing=dp(4), size_hint_y=None, height=dp(26))
+                row.add_widget(MDLabel(text=date_obj.strftime("%d/%m/%Y"), font_style="Caption"))
+                row.add_widget(MDLabel(text=day_name, font_style="Caption"))
+                row.add_widget(MDLabel(text=hours_cell, font_style="Caption"))
+                container.add_widget(row)
+
+                self._last_timesheet_rows.append([date_obj.strftime("%d/%m/%Y"), day_name, hours_cell])
+
+            self._last_timesheet_total_hours = total_hours
+            if hasattr(ids, 'timesheet_status_label'):
+                ids.timesheet_status_label.text = (
+                    f"Pay period {start_d.strftime('%d/%m/%Y')} - {end_d.strftime('%d/%m/%Y')} "
+                    f"| Total: {total_hours:.0f} hrs"
+                )
+        except Exception:
+            logger.exception("Error generating timesheet:")
+
+    def upload_signature(self):
+        """Select a staff signature from the phone gallery/file picker.
+
+        This intentionally uses the same corrected Android picker as the
+        registration photo control, including the fallback for builds where
+        ``PythonActivity``/the activity wrapper has no ``bind`` method.
+        """
+        self._open_image_gallery('signature')
+
+    def signature_captured(self, path):
+        if path and os.path.exists(path):
+            self.signature_path = path
+            logger.info(f"Signature photo saved successfully to path: {path}")
+            try:
+                ids = self.timesheet_screen.ids
+                if hasattr(ids, 'timesheet_signature_preview'):
+                    ids.timesheet_signature_preview.source = path
+                    ids.timesheet_signature_preview.reload()
+            except Exception:
+                logger.exception("Failed to refresh signature preview UI:")
+        else:
+            logger.warning("Signature capture returned no valid file path.")
+
+    def export_timesheet_excel(self):
+        try:
+            filepath = self._export_timesheet_template()
+            if not filepath:
+                self.timesheet_screen.ids.timesheet_status_label.text = "Load a timesheet first."
+                return None
+            self._last_export_path = filepath
+            self.timesheet_screen.ids.timesheet_status_label.text = (
+                f"Exported: {os.path.basename(filepath)}"
+            )
+            self._queue_excel_auto_sync(filepath, "timesheet")
+            logger.info("Timesheet exported from supplied template: %s", filepath)
+            return filepath
+        except Exception:
+            logger.exception("Error exporting timesheet:")
+            if hasattr(self.timesheet_screen.ids, "timesheet_status_label"):
+                self.timesheet_screen.ids.timesheet_status_label.text = "Error exporting timesheet - see logs."
+            return None
+
+
+
+if __name__ == "__main__":
+    try:
+        ROHIAttendanceApp().run()
+    except Exception:
+        logger.exception("Application exited with unhandled top-level exception:")
+        import traceback
+        crash_text = "\n===== STARTUP ERROR %s =====\n%s" % (datetime.now(), traceback.format_exc())
+        try:
+            with open(os.path.join(APP_DIR, "logs", "startup_error.txt"), "a", encoding="utf-8") as f:
+                f.write(crash_text)
+        except Exception: pass
+        # Also copy the crash into the public Downloads folder via
+        # MediaStore. Android/data/<pkg>/files (used in a previous attempt)
+        # is blocked from ALL other apps on Android 11+, including Termux,
+        # even with "All files access" granted - only root/adb can reach it.
+        # MediaStore's Downloads collection is the one place a plain
+        # third-party app (Termux, with normal storage permission) can still
+        # read on modern Android without root or adb.
+        try:
+            from jnius import autoclass
+            ContentValues = autoclass("android.content.ContentValues")
+            MediaStoreDownloads = autoclass("android.provider.MediaStore$Downloads")
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            activity = PythonActivity.mActivity
+            resolver = activity.getContentResolver()
+
+            values = ContentValues()
+            values.put("_display_name", "rohi_crash_log.txt")
+            values.put("mime_type", "text/plain")
+            values.put("relative_path", "Download/")
+
+            item_uri = resolver.insert(MediaStoreDownloads.EXTERNAL_CONTENT_URI, values)
+            if item_uri is not None:
+                out_stream = resolver.openOutputStream(item_uri)
+                out_stream.write(crash_text.encode("utf-8"))
+                out_stream.close()
+        except Exception: pass
+        traceback.print_exc()
+        raise
+    finally:
+        logger.info("ROHI Attendance App process stopped.")

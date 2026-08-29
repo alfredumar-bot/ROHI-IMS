@@ -1,0 +1,73 @@
+<MonthlyReportScreen>:
+    MDScreen:
+        md_bg_color: 0.95, 0.95, 0.95, 1
+
+        MDBoxLayout:
+            orientation: "vertical"
+
+            MDTopAppBar:
+                title: "ROHI ACTIVITY REPORT - MONTHLY SUMMARY REPORT"
+                elevation: 2
+                md_bg_color: 0.13, 0.40, 0.16, 1
+                specific_text_color: 1, 1, 1, 1
+                left_action_items: [["arrow-left", lambda x: app.open_dashboard()]]
+
+            ScrollView:
+                MDBoxLayout:
+                    orientation: "vertical"
+                    padding: dp(14)
+                    spacing: dp(10)
+                    size_hint_y: None
+                    height: self.minimum_height
+                    MDLabel:
+                        id: monthly_staff
+                        text: "Reported By:"
+                        bold: True
+                        adaptive_height: True
+                    MDTextField:
+                        id: monthly_date
+                        hint_text: "Date"
+                    MDTextField:
+                        id: monthly_location
+                        hint_text: "Location (Name of town)"
+                    MDTextField:
+                        id: monthly_project
+                        hint_text: "Project"
+                    MDTextField:
+                        id: monthly_duration
+                        hint_text: "Duration (Number of days spent in the field)"
+                    MDTextField:
+                        id: monthly_type
+                        hint_text: "Type of Activity"
+                        text: "Monthly Summary Report"
+                        readonly: True
+                    MDTextField:
+                        id: monthly_subactivity
+                        hint_text: "Sub-Activity - list activities carried out"
+                        multiline: True
+                        size_hint_y: None
+                        height: dp(110)
+                    MDTextField:
+                        id: monthly_narrative
+                        hint_text: "Narrative - provide details, names, figures, locations, charts, etc."
+                        multiline: True
+                        size_hint_y: None
+                        height: dp(180)
+                    MDTextField:
+                        id: monthly_achievements
+                        hint_text: "Achievements"
+                        multiline: True
+                        size_hint_y: None
+                        height: dp(110)
+                    MDLabel:
+                        id: monthly_photo_status
+                        text: "Pictorials: 0/4"
+                        theme_text_color: "Secondary"
+                        adaptive_height: True
+                    MDRaisedButton:
+                        text: "SELECT FROM GALLERY (MAX 4)"
+                        on_release: app.open_report_gallery("monthly")
+                    MDRaisedButton:
+                        text: "SEND TO GOOGLE"
+                        md_bg_color: 0.13,0.40,0.16,1
+                        on_release: app.submit_monthly_report()
