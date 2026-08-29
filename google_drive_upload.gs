@@ -246,7 +246,10 @@ function getCfmStatuses_() {
 }
 
 function uploadExcel_(data) {
-  const reportType = String(data.report_type || '').toLowerCase();
+  let reportType = String(data.report_type || '').toLowerCase();
+  // Backward compatibility: older APK builds sent 'monthly'; the configured
+  // Drive tree uses the explicit monthly_report key.
+  if (reportType === 'monthly') reportType = 'monthly_report';
   const filename = String(
     data.filename || ('ROHI_' + reportType + '_' + timestamp_() + '.xlsx')
   );
@@ -486,6 +489,9 @@ function submitAttendance_(data) {
 }
 
 function submitStaff_(data) {
+  if (!CONFIG.staffSpreadsheetId) {
+    throw new Error('ROHI Staff Registration spreadsheet ID is not configured.');
+  }
   const sheet = getSheet_(CONFIG.staffSpreadsheetId, CONFIG.staffSheetName);
 
   const fields = [
@@ -546,7 +552,9 @@ function submitStaff_(data) {
   return {
     ok:true,
     message: row > 0 ? 'Registration record updated.' : 'Registration submitted.',
-    row: row > 0 ? row : sheet.getLastRow()
+    row: row > 0 ? row : sheet.getLastRow(),
+    spreadsheet_id: CONFIG.staffSpreadsheetId,
+    sheet_name: sheet.getName()
   };
 }
 

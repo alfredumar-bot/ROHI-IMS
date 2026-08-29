@@ -209,7 +209,7 @@
                                         MDBoxLayout:
                                             orientation: 'vertical'
                                             spacing: dp(3)
-                                            size_hint_x: 0.5
+                                            size_hint_x: 1
 
                                             MDLabel:
                                                 id: staff_id_label
@@ -251,8 +251,9 @@
 
                                         MDBoxLayout:
                                             orientation: 'vertical'
-                                            spacing: dp(3)
-                                            size_hint_x: 0.5
+                                            spacing: dp(2)
+                                            size_hint_x: None
+                                            width: dp(190)
 
                                             MDLabel:
                                                 id: push_reports_status
@@ -265,7 +266,7 @@
 
                                             MDLabel:
                                                 id: excel_sync_status
-                                                text: "Excel Sync: checking..."
+                                                text: "Sync status: 0/7"
                                                 font_style: "Caption"
                                                 bold: True
                                                 theme_text_color: "Custom"
@@ -274,60 +275,53 @@
                                                 shorten: True
                                                 shorten_from: "right"
 
-                                            # Gmail / Google Meet / Power BI / DHIS2 quick links, moved
-                                            # here (next to Staff ID/Cluster/etc.) instead of their own
-                                            # separate full-width row below the card.
                                             MDGridLayout:
-                                                cols: 4
+                                                cols: 5
+                                                size_hint_x: None
+                                                width: dp(190)
                                                 size_hint_y: None
-                                                height: dp(40)
-                                                spacing: dp(2)
-                                                padding: [0, dp(4), 0, 0]
+                                                height: dp(38)
+                                                spacing: dp(0)
+                                                padding: [0, 0, 0, 0]
 
                                                 MDIconButton:
                                                     icon: "gmail"
                                                     size_hint: None, None
-                                                    size: dp(36), dp(36)
+                                                    size: dp(38), dp(38)
                                                     theme_text_color: "Custom"
                                                     text_color: 0.85, 0.20, 0.15, 1
+                                                    tooltip_text: "Gmail"
                                                     on_release: app.open_dashboard_gmail()
                                                 MDIconButton:
                                                     icon: "video-account"
                                                     size_hint: None, None
-                                                    size: dp(36), dp(36)
+                                                    size: dp(38), dp(38)
                                                     theme_text_color: "Custom"
                                                     text_color: 0.10, 0.45, 0.85, 1
+                                                    tooltip_text: "Google Meet"
                                                     on_release: app.open_google_meeting()
-                                                MDIconButton:
-                                                    icon: "desktop-classic"
+                                                LogoButton:
+                                                    source: "assets/powerbi_logo.png"
                                                     size_hint: None, None
-                                                    size: dp(36), dp(36)
-                                                    theme_text_color: "Custom"
-                                                    text_color: 0.95, 0.65, 0.05, 1
-                                                    on_release: app.open_external_link(app.ROHI_EXTERNAL_LINKS["powerbi"], "Power BI")
-                                                MDIconButton:
-                                                    icon: "database-outline"
+                                                    size: dp(38), dp(38)
+                                                    allow_stretch: True
+                                                    keep_ratio: True
+                                                    on_release: app.open_external_link(app.ROHI_EXTERNAL_LINKS.get("powerbi", "https://app.powerbi.com/"), "Power BI")
+                                                LogoButton:
+                                                    source: "assets/dhis2_logo.png"
                                                     size_hint: None, None
-                                                    size: dp(36), dp(36)
-                                                    theme_text_color: "Custom"
-                                                    text_color: 0.45, 0.25, 0.70, 1
-                                                    on_release: app.open_external_link(app.ROHI_EXTERNAL_LINKS["dhis2"], "DHIS2")
+                                                    size: dp(38), dp(38)
+                                                    allow_stretch: True
+                                                    keep_ratio: True
+                                                    on_release: app.open_dashboard_dhis2()
+                                                LogoButton:
+                                                    source: "assets/browser_logo.png"
+                                                    size_hint: None, None
+                                                    size: dp(38), dp(38)
+                                                    allow_stretch: True
+                                                    keep_ratio: True
+                                                    on_release: app.open_dashboard_browser()
 
-                                # Dashboard quick link (Website)
-                                MDBoxLayout:
-                                    orientation: "horizontal"
-                                    size_hint_y: None
-                                    height: dp(46)
-                                    spacing: dp(4)
-                                    padding: [dp(2), 0, dp(2), 0]
-
-                                    MDIconButton:
-                                        icon: "web"
-                                        size_hint: None, None
-                                        size: dp(40), dp(40)
-                                        theme_text_color: "Custom"
-                                        text_color: 0.0, 0.55, 0.55, 1
-                                        on_release: app.open_external_link(app.ROHI_EXTERNAL_LINKS["website"], "Website")
 
                                 # 2. Attendance Status Metrics Cards (Absent, Punctuality, Late + Zigzag Trend)
                                 MDGridLayout:
@@ -1315,34 +1309,34 @@
                                             icon: "whatsapp"
                                             size_hint: None, None
                                             size: dp(34), dp(34)
-                                            on_release: app.open_external_link(app.ROHI_EXTERNAL_LINKS.get("whatsapp", ""), "WhatsApp")
+                                            on_release: app.open_whatsapp()
                                         MDIconButton:
                                             icon: "linkedin"
                                             size_hint: None, None
                                             size: dp(34), dp(34)
-                                            on_release: app.open_external_link(app.ROHI_EXTERNAL_LINKS["linkedin"], "LinkedIn")
+                                            on_release: app.open_external_link(app.ROHI_EXTERNAL_LINKS.get("linkedin", ""), "LinkedIn")
                                         MDIconButton:
                                             icon: "facebook"
                                             size_hint: None, None
                                             size: dp(34), dp(34)
-                                            on_release: app.open_external_link(app.ROHI_EXTERNAL_LINKS["facebook"], "Facebook")
+                                            on_release: app.open_external_link(app.ROHI_EXTERNAL_LINKS.get("facebook", ""), "Facebook")
                                         MDIconButton:
                                             icon: "twitter"
                                             size_hint: None, None
                                             size: dp(34), dp(34)
-                                            on_release: app.open_external_link(app.ROHI_EXTERNAL_LINKS["twitter"], "Twitter")
+                                            on_release: app.open_external_link(app.ROHI_EXTERNAL_LINKS.get("twitter", ""), "Twitter")
                                         MDIconButton:
                                             icon: "instagram"
                                             size_hint: None, None
                                             size: dp(34), dp(34)
-                                            on_release: app.open_external_link(app.ROHI_EXTERNAL_LINKS["instagram"], "Instagram")
+                                            on_release: app.open_external_link(app.ROHI_EXTERNAL_LINKS.get("instagram", ""), "Instagram")
                                         TikTokButton:
                                             source: "assets/tiktok_logo.png"
                                             size_hint: None, None
                                             size: dp(34), dp(34)
                                             allow_stretch: True
                                             keep_ratio: True
-                                            on_release: app.open_external_link(app.ROHI_EXTERNAL_LINKS["tiktok"], "TikTok")
+                                            on_release: app.open_external_link(app.ROHI_EXTERNAL_LINKS.get("tiktok", ""), "TikTok")
 
         # Left Navigation Drawer
         MDNavigationDrawer:
@@ -1413,45 +1407,42 @@
 
                         MDSeparator:
 
-                        # Attendance Module
-                        TwoLineIconListItem:
+                        # 2. Daily/Weekly Performance Tracker
+                        OneLineIconListItem:
+                            text: "Daily/Weekly Performance Tracker (DWPT)"
+                            on_release:
+                                nav_drawer.set_state("close")
+                                app.open_dwpt()
+                            IconLeftWidget:
+                                icon: "chart-line"
+
+                        MDSeparator:
+
+                        # 3. Attendance
+                        OneLineIconListItem:
                             text: "Attendance"
-                            secondary_text: "Daily Check In / Out & Timesheets"
+                            on_release:
+                                nav_drawer.set_state("close")
+                                app.open_dashboard()
                             IconLeftWidget:
                                 icon: "calendar-clock-outline"
 
+                        MDSeparator:
+
+                        # 4. Timesheet Management
                         OneLineIconListItem:
-                            text: "Attendance Reports"
-                            on_release:
-                                nav_drawer.set_state("close")
-                                app.open_reports()
-                            IconLeftWidget:
-                                icon: "calendar-month-outline"
-                        OneLineIconListItem:
-                            text: "Overtime Hours"
-                            IconLeftWidget:
-                                icon: "clock-plus-outline"
-                        OneLineIconListItem:
-                            text: "Timesheet Summary"
+                            text: "Timesheet Management"
                             on_release:
                                 nav_drawer.set_state("close")
                                 app.open_timesheet()
                             IconLeftWidget:
                                 icon: "table-clock"
-                        OneLineIconListItem:
-                            text: "Export Attendance (PDF/Excel)"
-                            on_release:
-                                nav_drawer.set_state("close")
-                                app.open_reports()
-                            IconLeftWidget:
-                                icon: "file-export-outline"
 
                         MDSeparator:
 
-                        # Leave Management Module
-                        TwoLineIconListItem:
+                        # 5. Leave Management
+                        OneLineIconListItem:
                             text: "Leave Management"
-                            secondary_text: "Requests, Balances & Approvals"
                             on_release:
                                 nav_drawer.set_state("close")
                                 app.open_leave()
@@ -1460,16 +1451,7 @@
 
                         MDSeparator:
 
-                        # Daily/Weekly Performance Tracker (DWPT)
-                        OneLineIconListItem:
-                            text: "Daily/Weekly Performance Tracker (DWPT)"
-                            on_release:
-                                nav_drawer.set_state("close")
-                                app.open_dwpt()
-                            IconLeftWidget:
-                                icon: "chart-line"
-                        MDSeparator:
-                        # Monthly Report
+                        # 6. Monthly Report
                         OneLineIconListItem:
                             text: "Monthly Report"
                             on_release:
@@ -1477,11 +1459,12 @@
                                 app.open_monthly_report()
                             IconLeftWidget:
                                 icon: "file-document-outline"
+
                         MDSeparator:
-                        # Complaints & Feedback Mechanism
-                        TwoLineIconListItem:
+
+                        # 7. Complaints & Feedback Mechanism
+                        OneLineIconListItem:
                             text: "Complaints & Feedback (CFM)"
-                            secondary_text: "Community & Office Cases"
                             on_release:
                                 nav_drawer.set_state("close")
                                 app.open_cfm()

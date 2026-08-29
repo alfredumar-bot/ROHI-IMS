@@ -100,7 +100,7 @@ CHECKOUT_REMINDER_OFFSETS_MINUTES = [
 # Single source of truth for the app version shown in Settings. Keep this in
 # sync with the `version =` line in buildozer.spec every time you release an
 # update, so what's displayed on-screen always matches the installed build.
-APP_VERSION = "2.1"
+APP_VERSION = "2.5"
 
 # Dashboard quick links supplied by ROHI. Empty URLs intentionally show a
 # "link will be provided shortly" message until production links are supplied.
@@ -110,11 +110,14 @@ ROHI_EXTERNAL_LINKS = {
     "facebook": "https://www.facebook.com/share/1b3hr7daFQ/",
     "linkedin": "https://www.linkedin.com/company/restoration-of-hope-initiative-rohi/",
     "tiktok": "https://www.tiktok.com/@rohinigeria?_r=1&_t=ZS-99HAs18jAIC",
-    "whatsapp": "",
-    "instagram": "",
-    "twitter": "",
-    "powerbi": "",
-    "dhis2": "",
+    # Intentionally unavailable: tapping these shows the standard
+    # "link will be provided shortly" message rather than doing nothing.
+    "whatsapp": "https://wa.me/",
+    "instagram": "https://www.instagram.com/rohi_nigeria01?igsi=MTJqcnUzcnRxOXRteA==",
+    "twitter": "https://x.com/nigeria_rohi?s=11",
+    "powerbi": "https://app.powerbi.com/",
+    "dhis2": "https://dhis2.org/",
+    "browser": "https://www.restorationofhopeinitiative.org/",
 }
 
 
@@ -130,12 +133,13 @@ ATTENDANCE_EXCEL_SYNC_INTERVAL_SECONDS = 180  # attendance Excel auto-sync every
 TIMESHEET_EXCEL_SYNC_INTERVAL_SECONDS = 180  # timesheet Excel auto-sync every 3 minutes
 LEAVE_EXCEL_SYNC_INTERVAL_SECONDS = 180  # leave Excel auto-sync every 3 minutes
 EXCEL_SYNC_CONFIG_PATH = os.path.join(APP_DIR, "excel_sync_config.json")
+STAFF_PENDING_SYNC_PATH = os.path.join(APP_DIR, "staff_pending_sync.json")
 EXCEL_SYNC_DEFAULTS = {
     "attendance_link": "https://docs.google.com/spreadsheets/d/e/2PACX-1vRt9XLMR2O9eW2ZMCNvhgxa2iSw8wZTIQZdh4mPNjj7D20YhiuAJSWgOTL3bpBm0g/pubhtml?gid=1377847618&single=true",
     "timesheet_link": "https://drive.google.com/drive/folders/1GTYacKygoa9O9vH_Oo--ZVZtCijKrEfD?usp=sharing",
     "leave_link": "https://drive.google.com/drive/folders/1H2EPqb3mPXB2Dty5o7bsg7gopO8cXOSH?usp=sharing",
     "staff_link": "https://docs.google.com/spreadsheets/d/e/2PACX-1vRaprW63u3MXCbO5RJ0v7xXKkmNp8rVt8JSpPtZupBUAHq38e41c6_laoLjyEfItA/pubhtml?gid=2005932240&single=true",
-    "cfm_link": "",
+    "cfm_link": "https://docs.google.com/spreadsheets/d/16dFEsbp4vEV5b_2eR7v90VEjnKuKYzbw/edit?usp=drivesdk",
     "dwpt_link": "https://drive.google.com/drive/folders/1TwhbzPJ3WpNeJ2BErRVxvI8x_TaqyyBJ?usp=drive_link",
     "monthly_report_link": "https://drive.google.com/drive/folders/1w5oyuK9tW5uRipO3PMV1a7GH4Doo2t5_?usp=drive_link",
     # A Google Drive folder URL is a browse/share link, not an upload API.
@@ -573,9 +577,12 @@ REQUIRED_REGISTRATION_FIELDS = [
 
 
 class TikTokButton(ButtonBehavior, Image):
-    """Image-based TikTok button so the dashboard uses the real logo asset
-    instead of a generic music-note Material Design icon.  ButtonBehavior
-    keeps the control lightweight and compatible with KivyMD 1.2.0."""
+    """Image-based TikTok button so the dashboard uses the real logo asset."""
+    pass
+
+
+class LogoButton(ButtonBehavior, Image):
+    """Lightweight image button used for official external-service logos."""
     pass
 
 
@@ -1609,7 +1616,9 @@ class ROHIAttendanceApp(MDApp):
 
     def connect_excel_report(self, report_type):
         """Test one report link in the background and show green/red status."""
-        url = str(self._excel_sync_state.get(f"{report_type}_link") or "").strip()
+        url = str(self._excel_sync_state.get(f"{report_type}_endpoint") or "").strip()
+        if not url:
+            url = str(self._excel_sync_state.get(f"{report_type}_link") or "").strip()
         # CFM may be configured with an Apps Script endpoint before a separate
         # Drive/Sheet browse link is supplied. Test the protected endpoint in
         # that case without exposing or changing the stored database settings.
@@ -1618,7 +1627,9 @@ class ROHIAttendanceApp(MDApp):
         if not url.startswith(("http://", "https://")):
             self._set_excel_link_status(report_type, False, f"{report_type.title()} link is missing or invalid.")
             return
-        self._set_excel_link_status(report_type, False, f"Connecting to {report_type.title()} link...")
+        already_connected = bool(self._excel_sync_state.get("link_status", {}).get(report_type, False))
+        if not already_connected:
+            self._set_excel_link_status(report_type, False, f"Connecting to {report_type.title()} link...")
         def worker():
             try:
                 req = Request(url, headers={"User-Agent": "ROHI-Attendance-App/1.7"}, method="GET")
@@ -1631,7 +1642,14 @@ class ROHIAttendanceApp(MDApp):
                 logger.exception("Excel link connection test failed for %s", report_type)
                 ok = False
                 msg = f"{report_type.title()} link failed: {exc}"
-            Clock.schedule_once(lambda dt: self._set_excel_link_status(report_type, ok, msg), 0)
+            # Once a link has successfully connected, keep that state during
+            # transient offline periods. A later successful test refreshes it.
+            # This prevents the dashboard from flickering back to 0/x merely
+            # because the phone temporarily lost data service.
+            if ok or not already_connected:
+                Clock.schedule_once(lambda dt: self._set_excel_link_status(report_type, ok, msg), 0)
+            else:
+                Clock.schedule_once(lambda dt: self._set_excel_link_status(report_type, True, f"{report_type.title()} remains connected; network retry pending."), 0)
         threading.Thread(target=worker, daemon=True).start()
 
     def _refresh_excel_sync_fields(self):
@@ -1877,7 +1895,8 @@ class ROHIAttendanceApp(MDApp):
         self._excel_sync_state = data
         _save_excel_sync_config(data)
         endpoint_count = sum(bool(data.get(k)) for k in (
-            "attendance_endpoint", "timesheet_endpoint", "leave_endpoint", "staff_endpoint"
+            "attendance_endpoint", "timesheet_endpoint", "leave_endpoint", "staff_endpoint",
+            "cfm_endpoint", "dwpt_endpoint", "monthly_report_endpoint"
         ))
         message = (
             f"Connected: {len([u for u in links if u])}/7 report links saved. "
@@ -1911,16 +1930,17 @@ class ROHIAttendanceApp(MDApp):
                 return
             ids = self.dashboard_screen.ids
             statuses = self._excel_sync_state.get("link_status", {})
-            connected_count = sum(bool(statuses.get(k, False)) for k in ("attendance", "timesheet", "leave", "staff"))
+            report_keys = ("attendance", "timesheet", "leave", "staff", "cfm", "dwpt", "monthly_report")
+            connected_count = sum(bool(statuses.get(k, False)) for k in report_keys)
             if "excel_sync_status" in ids:
-                if connected_count == 7:
-                    ids.excel_sync_status.text = "Excel Sync: CONNECTED (7/7)"
+                if connected_count == len(report_keys):
+                    ids.excel_sync_status.text = "Sync status: 7/7 CONNECTED"
                     ids.excel_sync_status.text_color = (0.13, 0.40, 0.16, 1)
                 elif connected_count > 0:
-                    ids.excel_sync_status.text = f"Excel Sync: {connected_count}/7 CONNECTED"
+                    ids.excel_sync_status.text = f"Sync status: {connected_count}/7 CONNECTED"
                     ids.excel_sync_status.text_color = (0.75, 0.55, 0.05, 1)
                 else:
-                    ids.excel_sync_status.text = "Excel Sync: NOT CONNECTED"
+                    ids.excel_sync_status.text = "Sync status: 0/7"
                     ids.excel_sync_status.text_color = (0.8, 0.1, 0.1, 1)
         except Exception:
             logger.exception("Could not update Excel sync dashboard status.")
@@ -2315,6 +2335,36 @@ class ROHIAttendanceApp(MDApp):
         except Exception:
             logger.exception("Google Meet app launch failed; using browser fallback.")
         return self.open_external_link(url, "Google Meet")
+
+    def open_whatsapp(self):
+        """Open the installed WhatsApp app, with a web fallback."""
+        if platform != "android":
+            return self.open_external_link("https://wa.me/", "WhatsApp")
+        try:
+            from jnius import autoclass
+            Intent = autoclass("android.content.Intent")
+            activity = self._get_android_activity()
+            intent = Intent(Intent.ACTION_MAIN)
+            intent.addCategory(Intent.CATEGORY_LAUNCHER)
+            intent.setPackage("com.whatsapp")
+            if intent.resolveActivity(activity.getPackageManager()) is not None:
+                activity.startActivity(intent)
+                return True
+        except Exception:
+            logger.exception("WhatsApp app launch failed; using browser fallback.")
+        return self.open_external_link("https://wa.me/", "WhatsApp")
+
+    def open_dashboard_dhis2(self):
+        """Open the configured DHIS2 server; use the public DHIS2 site if not configured."""
+        try:
+            cfg = _load_dhis2_config()
+            url = str(cfg.get("server_url") or "").strip() or ROHI_EXTERNAL_LINKS.get("dhis2", "https://dhis2.org/")
+        except Exception:
+            url = ROHI_EXTERNAL_LINKS.get("dhis2", "https://dhis2.org/")
+        return self.open_external_link(url, "DHIS2")
+
+    def open_dashboard_browser(self):
+        return self.open_external_link(ROHI_EXTERNAL_LINKS.get("browser", "https://www.restorationofhopeinitiative.org/"), "ROHI Website")
 
     def open_dashboard_gmail(self):
         """Open Gmail directly and attach the most recent generated report when available."""
@@ -3389,6 +3439,13 @@ class ROHIAttendanceApp(MDApp):
     # Silent Background Auto-Sync
     # -----------------------------
     def _auto_sync_tick(self, *args):
+        try:
+            # Retry any staff registrations that could not reach Google during
+            # registration/edit. This makes staff auto-sync persistent across
+            # temporary network loss and app restarts.
+            threading.Thread(target=self._retry_pending_staff_sync, daemon=True).start()
+        except Exception:
+            logger.exception("Pending staff auto-sync tick failed:")
         try:
             config = pg_sync.load_config()
             if config.get("host"):
@@ -5719,14 +5776,41 @@ class ROHIAttendanceApp(MDApp):
     def email_leave_report(self):
         """Open Android's share/email composer with the generated Leave XLSX attached."""
         path = getattr(self, '_last_export_path', None)
-        if not path or not os.path.exists(path) or 'leave_report' not in os.path.basename(path).lower():
+        if not path or not os.path.exists(path) or 'leave' not in os.path.basename(path).lower():
             path = self.export_leave_excel()
         return self._share_file_via_android(
             path,
             "ROHI Leave Management Report",
             "Attached is the generated ROHI Leave Management report.",
             self._set_leave_send_status,
+            package_name="com.google.android.gm",
         )
+
+    def email_dwpt_report(self):
+        path = getattr(self, "_last_export_path", None)
+        if not path or not os.path.exists(path) or "dwpt" not in os.path.basename(path).lower():
+            path = os.path.join(APP_DIR, "ROHI_DWPT.xlsx")
+        return self._share_file_via_android(path, "ROHI DWPT Report", "Attached is the ROHI Daily/Weekly Performance Tracker report.", self._set_dwpt_send_status, package_name="com.google.android.gm")
+
+    def email_monthly_report(self):
+        path = getattr(self, "_last_export_path", None)
+        if not path or not os.path.exists(path) or "monthly" not in os.path.basename(path).lower():
+            path = os.path.join(APP_DIR, "ROHI_Monthly_Report.xlsx")
+        return self._share_file_via_android(path, "ROHI Monthly Report", "Attached is the ROHI Monthly Summary Report.", self._set_monthly_send_status, package_name="com.google.android.gm")
+
+    @mainthread
+    def _set_dwpt_send_status(self, message, ok=True):
+        try:
+            self.dwpt_screen.ids.dwpt_send_status.text = message
+            self.dwpt_screen.ids.dwpt_send_status.text_color = (0.13, 0.40, 0.16, 1) if ok else (0.8, 0.1, 0.1, 1)
+        except Exception: pass
+
+    @mainthread
+    def _set_monthly_send_status(self, message, ok=True):
+        try:
+            self.monthly_report_screen.ids.monthly_send_status.text = message
+            self.monthly_report_screen.ids.monthly_send_status.text_color = (0.13, 0.40, 0.16, 1) if ok else (0.8, 0.1, 0.1, 1)
+        except Exception: pass
 
     def export_report_excel(self):
         self._export_attendance_rows(getattr(self, '_last_report_rows', []), fmt='excel', scope='selected-period')
@@ -5818,26 +5902,37 @@ class ROHIAttendanceApp(MDApp):
         self._set_gallery_status(self._gallery_target, f'Photos: {count}/{limit}')
 
     def _report_upload(self, kind, fields, filename):
-        try:
-            path=os.path.join(APP_DIR, filename)
-            wb=openpyxl.Workbook(); ws=wb.active; ws.title='Report'
-            for k,v in fields: ws.append([k, v])
-            images=(getattr(self,'_report_images',{}) or {}).get(kind, [])
-            from openpyxl.drawing.image import Image as XLImage
-            for n,img_path in enumerate(images, start=1):
-                try:
-                    im=XLImage(img_path); im.width=420; im.height=300
-                    ws.add_image(im, f'D{1+(n-1)*18}')
-                except Exception: logger.exception('Could not embed report image')
-            wb.save(path)
-            self._last_export_path = path
-            endpoint=EXCEL_SYNC_DEFAULTS.get('dwpt_endpoint' if kind=='dwpt' else 'monthly_report_endpoint','')
-            ok,msg=_http_upload_excel(path, endpoint, kind, self._registered_state_office())
-            if ok: self.show_info_dialog('Report Sent', f"{msg}\n\nA copy was also saved on this device at:\n{path}")
-            else: self.show_info_dialog('Send Failed', f"{msg}\n\nA copy was still saved on this device at:\n{path}")
-        except Exception as exc:
-            logger.exception('Report generation failed')
-            self.show_info_dialog('Report Error', str(exc))
+        """Build and upload DWPT/Monthly reports without blocking the UI."""
+        drive_kind = "monthly_report" if kind == "monthly" else "dwpt"
+        status_cb = self._set_monthly_send_status if kind == "monthly" else self._set_dwpt_send_status
+        status_cb("Preparing report...", True)
+
+        def worker():
+            try:
+                path = os.path.join(APP_DIR, filename)
+                wb = openpyxl.Workbook(); ws = wb.active; ws.title = "Report"
+                for k, v in fields: ws.append([k, v])
+                images = (getattr(self, "_report_images", {}) or {}).get(kind, [])
+                from openpyxl.drawing.image import Image as XLImage
+                for n, img_path in enumerate(images, start=1):
+                    try:
+                        im = XLImage(img_path); im.width = 420; im.height = 300
+                        ws.add_image(im, f"D{1 + (n-1)*18}")
+                    except Exception: logger.exception("Could not embed report image")
+                wb.save(path)
+                self._last_export_path = path
+                endpoint = str(self._excel_sync_state.get(f"{drive_kind}_endpoint", EXCEL_SYNC_DEFAULTS.get(f"{drive_kind}_endpoint", "")) or "").strip()
+                ok, msg = _http_upload_excel(path, endpoint, drive_kind, self._registered_state_office())
+                if ok:
+                    self._excel_sync_state[f"last_{drive_kind}_sync"] = datetime.now().isoformat(timespec="seconds")
+                    _save_excel_sync_config(self._excel_sync_state)
+                    Clock.schedule_once(lambda dt: status_cb(f"Successfully sent to Google Drive ({self._registered_state_office()}).", True), 0)
+                else:
+                    Clock.schedule_once(lambda dt: status_cb(f"Send failed: {msg}", False), 0)
+            except Exception as exc:
+                logger.exception("Report generation/upload failed")
+                Clock.schedule_once(lambda dt: status_cb(f"Report error: {exc}", False), 0)
+        threading.Thread(target=worker, daemon=True).start()
 
     def submit_dwpt(self):
         ids=self.dwpt_screen.ids
@@ -5865,6 +5960,7 @@ class ROHIAttendanceApp(MDApp):
                     "Information is handled confidentially for follow-up, safeguarding "
                     "and programme improvement."
                 )
+            self._sync_cfm_statuses_from_google()
             self.refresh_cfm_cases()
         except Exception:
             logger.exception("Unable to open CFM screen")
@@ -6474,7 +6570,7 @@ class ROHIAttendanceApp(MDApp):
             reports_dir = directory or self._get_download_dir()
             fullname = str(self.current_user[1]) if len(self.current_user) > 1 else "Staff"
             name_parts = fullname.strip().split()
-            short_name = ((name_parts[0][0].upper() + " " + " ".join(name_parts[1:]))
+            short_name = ((name_parts[0][0].upper() + " " + name_parts[-1])
                           if len(name_parts) >= 2 else (name_parts[0] if name_parts else "Staff"))
             state_office = str(self.current_user[13]) if len(self.current_user) > 13 and self.current_user[13] else "Unassigned"
             office_short = re.sub(r"\s+(State Office|HQ)$", "", state_office, flags=re.I).strip() or "Unassigned"
@@ -6564,11 +6660,72 @@ class ROHIAttendanceApp(MDApp):
         }
         return self._post_rohi_json(endpoint, payload, timeout=30)
 
+    def _load_pending_staff_sync(self):
+        try:
+            if os.path.exists(STAFF_PENDING_SYNC_PATH):
+                with open(STAFF_PENDING_SYNC_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return data if isinstance(data, list) else []
+        except Exception:
+            logger.exception("Could not load pending staff sync queue.")
+        return []
+
+    def _save_pending_staff_sync(self, rows):
+        try:
+            os.makedirs(os.path.dirname(STAFF_PENDING_SYNC_PATH), exist_ok=True)
+            with open(STAFF_PENDING_SYNC_PATH, "w", encoding="utf-8") as f:
+                json.dump(rows[-20:], f, ensure_ascii=False, indent=2)
+            return True
+        except Exception:
+            logger.exception("Could not save pending staff sync queue.")
+            return False
+
+    def _queue_pending_staff_sync(self, staff_data):
+        payload = dict(staff_data or {})
+        payload.pop("password", None)
+        queue = self._load_pending_staff_sync()
+        # Replace an older copy of the same profile instead of creating duplicates.
+        uid = str(payload.get("unique_id") or "").strip()
+        email = str(payload.get("email") or "").strip().lower()
+        filtered = []
+        for item in queue:
+            if uid and str(item.get("unique_id") or "").strip() == uid:
+                continue
+            if email and str(item.get("email") or "").strip().lower() == email:
+                continue
+            filtered.append(item)
+        payload["queued_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        filtered.append(payload)
+        self._save_pending_staff_sync(filtered)
+
+    def _retry_pending_staff_sync(self):
+        queue = self._load_pending_staff_sync()
+        if not queue:
+            return
+        remaining = []
+        for item in queue:
+            ok, message = self._submit_staff_registration_to_endpoint(item)
+            if not ok:
+                remaining.append(item)
+                logger.warning("Pending staff sync retry failed: %s", message)
+                # Avoid hammering the server while offline. Retry the remaining
+                # records on the next auto-sync interval.
+                remaining.extend(queue[queue.index(item)+1:])
+                break
+            logger.info("Pending staff registration synced successfully: %s", item.get("unique_id") or item.get("email"))
+        self._save_pending_staff_sync(remaining)
+        if not remaining:
+            self._set_staff_registration_sync_status("Staff registration auto-sync complete.", True)
+
     def _submit_staff_registration_to_endpoint(self, staff_data):
         """Immediately submit registration/profile data to the configured
         staff endpoint. This updates the Google Sheet directly; it is not an
         email action and does not require a Google account chooser."""
-        endpoint = str(self._excel_sync_state.get("staff_endpoint") or "").strip()
+        endpoint = str(
+            self._excel_sync_state.get("staff_endpoint")
+            or EXCEL_SYNC_DEFAULTS.get("staff_endpoint")
+            or ""
+        ).strip()
         if not endpoint:
             return False, "Staff automatic endpoint is not configured."
         safe_data = dict(staff_data or {})
@@ -6579,7 +6736,12 @@ class ROHIAttendanceApp(MDApp):
         return self._post_rohi_json(endpoint, safe_data, timeout=30)
 
     def _submit_staff_registration_immediately(self, staff_data):
-        """Run immediate staff registration sync in the background."""
+        """Send staff registration immediately and queue it safely for retry.
+
+        A failed network/server attempt is never discarded. The profile is kept
+        in a small local pending queue and the normal auto-sync loop retries it
+        automatically when connectivity returns.
+        """
         def worker():
             ok, message = self._submit_staff_registration_to_endpoint(staff_data)
             if ok:
@@ -6587,15 +6749,11 @@ class ROHIAttendanceApp(MDApp):
                     "Registration submitted to Google successfully.", True
                 )
                 return
-            # Keep the existing workbook upload as a fallback when a file
-            # endpoint is deliberately configured. Do not open Google or ask
-            # the user to select an account.
-            try:
-                path = self._export_staff_template(for_sync=True)
-                self._send_excel_now(path, "staff", self._set_staff_registration_sync_status)
-            except Exception:
-                logger.exception("Staff registration fallback export failed.")
-                self._set_staff_registration_sync_status(message, False)
+            self._queue_pending_staff_sync(staff_data)
+            self._set_staff_registration_sync_status(
+                "Registration saved. Google sync will retry automatically when connected.", False
+            )
+            logger.warning("Staff registration queued for auto-sync: %s", message)
         threading.Thread(target=worker, daemon=True).start()
 
     def _send_excel_now(self, filepath, report_type, status_callback=None, cleanup_path=None):
@@ -6775,6 +6933,9 @@ class ROHIAttendanceApp(MDApp):
             if hasattr(self.leave_screen.ids, "leave_message"):
                 self.leave_screen.ids.leave_message.text = message
                 self.leave_screen.ids.leave_message.text_color = (0.13, 0.40, 0.16, 1) if ok else (0.8, 0.1, 0.1, 1)
+                if hasattr(self.leave_screen.ids, "leave_send_status"):
+                    self.leave_screen.ids.leave_send_status.text = message
+                    self.leave_screen.ids.leave_send_status.text_color = (0.13, 0.40, 0.16, 1) if ok else (0.8, 0.1, 0.1, 1)
         except Exception:
             pass
 

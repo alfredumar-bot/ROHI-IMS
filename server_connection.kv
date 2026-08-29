@@ -206,7 +206,7 @@
                             multiline: True
                             size_hint_y: None
                             height: dp(64)
-                            disabled: not app.google_links_unlocked
+                            readonly: not app.google_links_unlocked
                             opacity: 1
 
                         MDTextField:
@@ -215,16 +215,34 @@
                             multiline: True
                             size_hint_y: None
                             height: dp(64)
-                            disabled: not app.google_links_unlocked
+                            readonly: not app.google_links_unlocked
                             opacity: 1
 
                         MDTextField:
+                        MDTextField:
+                            id: dwpt_endpoint_field
+                            hint_text: "DWPT automatic upload endpoint (required for Send to Google)"
+                            multiline: True
+                            size_hint_y: None
+                            height: dp(64)
+                            readonly: not app.google_links_unlocked
+                            opacity: 1
+
+                        MDTextField:
+                            id: monthly_report_endpoint_field
+                            hint_text: "Monthly Report automatic upload endpoint (required for Send to Google)"
+                            multiline: True
+                            size_hint_y: None
+                            height: dp(64)
+                            readonly: not app.google_links_unlocked
+                            opacity: 1
+
                             id: attendance_link_field
                             hint_text: "ROHI Attendance Report link"
                             multiline: True
                             size_hint_y: None
                             height: dp(64)
-                            disabled: not app.google_links_unlocked
+                            readonly: not app.google_links_unlocked
                             opacity: 1
 
                         MDBoxLayout:
@@ -265,7 +283,7 @@
                                 text: "CONNECT ATTENDANCE"
                                 size_hint_x: 0.58
                                 md_bg_color: 0.13, 0.40, 0.16, 1
-                                disabled: not app.google_links_unlocked
+                                disabled: False
                                 on_release: app.connect_excel_report("attendance")
 
                         MDTextField:
@@ -274,7 +292,7 @@
                             multiline: True
                             size_hint_y: None
                             height: dp(64)
-                            disabled: not app.google_links_unlocked
+                            readonly: not app.google_links_unlocked
                             opacity: 1
 
                         MDTextField:
@@ -283,7 +301,7 @@
                             multiline: True
                             size_hint_y: None
                             height: dp(64)
-                            disabled: not app.google_links_unlocked
+                            readonly: not app.google_links_unlocked
                             opacity: 1
 
                         MDBoxLayout:
@@ -324,7 +342,7 @@
                                 text: "CONNECT TIMESHEET"
                                 size_hint_x: 0.58
                                 md_bg_color: 0.13, 0.40, 0.16, 1
-                                disabled: not app.google_links_unlocked
+                                disabled: False
                                 on_release: app.connect_excel_report("timesheet")
 
                         MDTextField:
@@ -333,7 +351,7 @@
                             multiline: True
                             size_hint_y: None
                             height: dp(64)
-                            disabled: not app.google_links_unlocked
+                            readonly: not app.google_links_unlocked
                             opacity: 1
 
                         MDTextField:
@@ -342,7 +360,7 @@
                             multiline: True
                             size_hint_y: None
                             height: dp(64)
-                            disabled: not app.google_links_unlocked
+                            readonly: not app.google_links_unlocked
                             opacity: 1
 
                         MDBoxLayout:
@@ -383,7 +401,7 @@
                                 text: "CONNECT LEAVE"
                                 size_hint_x: 0.58
                                 md_bg_color: 0.13, 0.40, 0.16, 1
-                                disabled: not app.google_links_unlocked
+                                disabled: False
                                 on_release: app.connect_excel_report("leave")
 
                         MDTextField:
@@ -392,7 +410,7 @@
                             multiline: True
                             size_hint_y: None
                             height: dp(64)
-                            disabled: not app.google_links_unlocked
+                            readonly: not app.google_links_unlocked
                             opacity: 1
 
                         MDTextField:
@@ -401,7 +419,7 @@
                             multiline: True
                             size_hint_y: None
                             height: dp(64)
-                            disabled: not app.google_links_unlocked
+                            readonly: not app.google_links_unlocked
                             opacity: 1
 
                         MDBoxLayout:
@@ -442,7 +460,7 @@
                                 text: "CONNECT STAFF"
                                 size_hint_x: 0.58
                                 md_bg_color: 0.13, 0.40, 0.16, 1
-                                disabled: not app.google_links_unlocked
+                                disabled: False
                                 on_release: app.connect_excel_report("staff")
 
                         MDTextField:
@@ -451,7 +469,7 @@
                             multiline: True
                             size_hint_y: None
                             height: dp(64)
-                            disabled: not app.google_links_unlocked
+                            readonly: not app.google_links_unlocked
                             opacity: 1
 
                         MDBoxLayout:
@@ -492,7 +510,7 @@
                                 text: "CONNECT CFM"
                                 size_hint_x: 0.58
                                 md_bg_color: 0.13, 0.40, 0.16, 1
-                                disabled: not app.google_links_unlocked
+                                disabled: False
                                 on_release: app.connect_excel_report("cfm")
 
                         MDTextField:
@@ -501,7 +519,7 @@
                             multiline: True
                             size_hint_y: None
                             height: dp(64)
-                            disabled: not app.google_links_unlocked
+                            readonly: not app.google_links_unlocked
                             opacity: 1
 
                         # ---------------- CFM Backup & Restore ----------------
@@ -557,7 +575,7 @@
                             multiline: True
                             size_hint_y: None
                             height: dp(64)
-                            disabled: not app.google_links_unlocked
+                            readonly: not app.google_links_unlocked
                             opacity: 1
 
                         MDLabel:

@@ -83,3 +83,20 @@
                         text: "SEND TO GOOGLE"
                         md_bg_color: 0.13,0.40,0.16,1
                         on_release: app.submit_dwpt()
+                    MDBoxLayout:
+                        size_hint_y: None
+                        height: dp(44)
+                        spacing: dp(8)
+                        MDIconButton:
+                            icon: "email-outline"
+                            md_bg_color: 0.13, 0.40, 0.16, 1
+                            theme_text_color: "Custom"
+                            text_color: 1, 1, 1, 1
+                            tooltip_text: "Email DWPT report"
+                            on_release: app.email_dwpt_report()
+                        MDLabel:
+                            id: dwpt_send_status
+                            text: ""
+                            theme_text_color: "Custom"
+                            text_color: 0.13, 0.40, 0.16, 1
+                            valign: "middle"
