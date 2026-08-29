@@ -1,0 +1,968 @@
+<CheckBox>:
+    color: 0, 0, 0, 0
+    size_hint: None, None
+    size: dp(20), dp(20)
+    canvas.before:
+        Color:
+            rgba: (0.13, 0.40, 0.16, 1) if self.active else (0.35, 0.35, 0.35, 1)
+        Line:
+            width: 2
+            rectangle: self.x + dp(3), self.y + dp(3), self.width - dp(6), self.height - dp(6)
+        Color:
+            rgba: (0.86, 0.95, 0.88, 1) if self.active else (0, 0, 0, 0)
+        Rectangle:
+            pos: self.x + dp(5), self.y + dp(5)
+            size: self.width - dp(10), self.height - dp(10)
+    canvas.after:
+        Color:
+            rgba: (0.13, 0.40, 0.16, 1) if self.active else (0, 0, 0, 0)
+        Line:
+            width: 2.4
+            points: [self.x + dp(7), self.y + self.height * 0.50, self.x + self.width * 0.42, self.y + dp(8), self.x + self.width - dp(7), self.y + self.height - dp(8)]
+
+<CFMScreen>:
+    MDScreen:
+        md_bg_color: 0.95, 0.95, 0.95, 1
+
+        MDBoxLayout:
+            orientation: "vertical"
+
+            MDTopAppBar:
+                title: "ROHI CFM"
+                elevation: 2
+                md_bg_color: 0.13, 0.40, 0.16, 1
+                left_action_items: [["arrow-left", lambda x: app.open_dashboard()]]
+
+            ScrollView:
+                do_scroll_x: False
+                do_scroll_y: True
+                bar_width: 0
+
+                MDBoxLayout:
+                    orientation: "vertical"
+                    padding: dp(12)
+                    spacing: dp(12)
+                    size_hint_y: None
+                    height: self.minimum_height
+
+                    MDLabel:
+                        text: "ROHI COMPLAINTS & FEEDBACK MECHANISM (CFM)"
+                        bold: True
+                        halign: "center"
+                        font_size: "19sp"
+                        theme_text_color: "Custom"
+                        text_color: 0.13, 0.40, 0.16, 1
+                        adaptive_height: True
+
+                    MDLabel:
+                        text: "Community & Office Level"
+                        halign: "center"
+                        theme_text_color: "Secondary"
+                        adaptive_height: True
+
+                    MDCard:
+                        orientation: "vertical"
+                        padding: dp(12)
+                        spacing: dp(9)
+                        size_hint_y: None
+                        height: dp(118)
+                        radius: [12,]
+                        elevation: 2
+
+                        MDLabel:
+                            text: "Submission Information"
+                            bold: True
+                            font_style: "Subtitle1"
+                            adaptive_height: True
+
+                        MDGridLayout:
+                            cols: 2
+                            spacing: dp(8)
+                            size_hint_y: None
+                            height: dp(52)
+
+                            MDTextField:
+                                id: cfm_date_received
+                                hint_text: "Date received"
+                                mode: "rectangle"
+                                text: app.cfm_today_date()
+                                readonly: True
+                                on_touch_down: if self.collide_point(*args[1].pos): app.open_cfm_date_picker()
+
+                            MDTextField:
+                                id: cfm_reference_input
+                                hint_text: "CFM Reference No."
+                                mode: "rectangle"
+                                text: "Auto-generated on submission"
+                                readonly: True
+
+                    MDLabel:
+                        text: "Location"
+                        bold: True
+                        adaptive_height: True
+
+                    MDBoxLayout:
+                        spacing: dp(10)
+                        size_hint_y: None
+                        height: dp(40)
+                        CheckBox:
+                            id: loc_community
+                            group: "cfm_location"
+                            size_hint_x: None
+                            width: dp(20)
+                        MDLabel:
+                            text: "Community"
+                            valign: "middle"
+                        CheckBox:
+                            id: loc_field_office
+                            group: "cfm_location"
+                            size_hint_x: None
+                            width: dp(20)
+                        MDLabel:
+                            text: "Field Office"
+                            valign: "middle"
+                        CheckBox:
+                            id: loc_head_office
+                            group: "cfm_location"
+                            size_hint_x: None
+                            width: dp(20)
+                        MDLabel:
+                            text: "Head Office"
+                            valign: "middle"
+                        CheckBox:
+                            id: loc_other
+                            group: "cfm_location"
+                            size_hint_x: None
+                            width: dp(20)
+                        MDLabel:
+                            text: "Other"
+                            valign: "middle"
+
+                    MDTextField:
+                        id: cfm_location_other
+                        hint_text: "Other location (if selected)"
+                        mode: "rectangle"
+                        size_hint_y: None
+                        height: dp(50)
+
+                    MDLabel:
+                        text: "Method"
+                        bold: True
+                        adaptive_height: True
+
+                    MDBoxLayout:
+                        spacing: dp(8)
+                        size_hint_y: None
+                        height: dp(40)
+                        CheckBox:
+                            id: method_suggestion
+                            size_hint_x: None
+                            width: dp(20)
+                        MDLabel:
+                            text: "Suggestion Box"
+                            valign: "middle"
+                        CheckBox:
+                            id: method_person
+                            size_hint_x: None
+                            width: dp(20)
+                        MDLabel:
+                            text: "In Person"
+                            valign: "middle"
+                        CheckBox:
+                            id: method_phone
+                            size_hint_x: None
+                            width: dp(20)
+                        MDLabel:
+                            text: "Phone"
+                            valign: "middle"
+                        CheckBox:
+                            id: method_whatsapp
+                            size_hint_x: None
+                            width: dp(20)
+                        MDLabel:
+                            text: "WhatsApp"
+                            valign: "middle"
+
+                    MDBoxLayout:
+                        spacing: dp(8)
+                        size_hint_y: None
+                        height: dp(40)
+                        CheckBox:
+                            id: method_email
+                            size_hint_x: None
+                            width: dp(20)
+                        MDLabel:
+                            text: "Email"
+                            valign: "middle"
+                        CheckBox:
+                            id: method_staff
+                            size_hint_x: None
+                            width: dp(20)
+                        MDLabel:
+                            text: "Staff/Volunteer"
+                            valign: "middle"
+                        CheckBox:
+                            id: method_meeting
+                            size_hint_x: None
+                            width: dp(20)
+                        MDLabel:
+                            text: "Community Meeting"
+                            valign: "middle"
+                        CheckBox:
+                            id: method_other
+                            size_hint_x: None
+                            width: dp(20)
+                        MDLabel:
+                            text: "Other"
+                            valign: "middle"
+
+                    MDTextField:
+                        id: cfm_method_other
+                        hint_text: "Other method (if selected)"
+                        mode: "rectangle"
+                        size_hint_y: None
+                        height: dp(50)
+
+                    MDLabel:
+                        text: "2. Complainant Information (Optional)"
+                        bold: True
+                        adaptive_height: True
+
+                    MDTextField:
+                        id: cfm_name
+                        hint_text: "Name"
+                        mode: "rectangle"
+                        size_hint_y: None
+                        height: dp(50)
+
+                    MDTextField:
+                        id: cfm_phone
+                        hint_text: "Phone/contact"
+                        mode: "rectangle"
+                        input_type: "number"
+                        size_hint_y: None
+                        height: dp(50)
+
+                    MDLabel:
+                        text: "Sex:"
+                        bold: True
+                        adaptive_height: True
+
+                    MDBoxLayout:
+                        spacing: dp(12)
+                        size_hint_y: None
+                        height: dp(40)
+                        CheckBox:
+                            id: sex_male
+                            group: "cfm_sex"
+                            size_hint_x: None
+                            width: dp(20)
+                        MDLabel:
+                            text: "Male"
+                            valign: "middle"
+                        CheckBox:
+                            id: sex_female
+                            group: "cfm_sex"
+                            size_hint_x: None
+                            width: dp(20)
+                        MDLabel:
+                            text: "Female"
+                            valign: "middle"
+                        CheckBox:
+                            id: sex_prefer
+                            group: "cfm_sex"
+                            size_hint_x: None
+                            width: dp(20)
+                        MDLabel:
+                            text: "Prefer not to say"
+                            valign: "middle"
+
+                    MDTextField:
+                        id: cfm_community
+                        hint_text: "Community/location"
+                        mode: "rectangle"
+                        size_hint_y: None
+                        height: dp(50)
+
+                    MDLabel:
+                        text: "Would you like to remain anonymous?"
+                        bold: True
+                        adaptive_height: True
+
+                    MDBoxLayout:
+                        spacing: dp(14)
+                        size_hint_y: None
+                        height: dp(40)
+                        CheckBox:
+                            id: anonymous_yes
+                            group: "cfm_anonymous"
+                            size_hint_x: None
+                            width: dp(20)
+                        MDLabel:
+                            text: "Yes"
+                            valign: "middle"
+                        CheckBox:
+                            id: anonymous_no
+                            group: "cfm_anonymous"
+                            size_hint_x: None
+                            width: dp(20)
+                        MDLabel:
+                            text: "No"
+                            valign: "middle"
+
+                    MDLabel:
+                        text: "Preferred way to receive a response:"
+                        bold: True
+                        adaptive_height: True
+
+                    MDBoxLayout:
+                        spacing: dp(8)
+                        size_hint_y: None
+                        height: dp(40)
+                        CheckBox:
+                            id: pref_phone
+                            group: "cfm_pref"
+                            size_hint_x: None
+                            width: dp(20)
+                        MDLabel:
+                            text: "Phone"
+                        CheckBox:
+                            id: pref_sms
+                            group: "cfm_pref"
+                            size_hint_x: None
+                            width: dp(20)
+                        MDLabel:
+                            text: "SMS"
+                        CheckBox:
+                            id: pref_whatsapp
+                            group: "cfm_pref"
+                            size_hint_x: None
+                            width: dp(20)
+                        MDLabel:
+                            text: "WhatsApp"
+                        CheckBox:
+                            id: pref_person
+                            group: "cfm_pref"
+                            size_hint_x: None
+                            width: dp(20)
+                        MDLabel:
+                            text: "In person"
+
+                    MDBoxLayout:
+                        spacing: dp(8)
+                        size_hint_y: None
+                        height: dp(40)
+                        CheckBox:
+                            id: pref_other
+                            group: "cfm_pref"
+                            size_hint_x: None
+                            width: dp(20)
+                        MDLabel:
+                            text: "Other"
+                        Widget:
+
+                    MDTextField:
+                        id: cfm_contact_other
+                        hint_text: "Other response method (if selected)"
+                        mode: "rectangle"
+                        size_hint_y: None
+                        height: dp(50)
+
+                    MDLabel:
+                        text: "3. Type of Complaint / Feedback"
+                        bold: True
+                        adaptive_height: True
+
+                    MDTextField:
+                        id: cfm_type
+                        hint_text: "Type of Complaint / Feedback — SELECT FROM DROPDOWN"
+                        mode: "rectangle"
+                        readonly: True
+                        right_icon: "menu-down"
+                        size_hint_y: None
+                        height: dp(56)
+                        on_touch_down: if self.collide_point(*args[1].pos): app.open_cfm_type_menu()
+
+                    MDTextField:
+                        id: cfm_type_other
+                        hint_text: "Other complaint/feedback type (if selected)"
+                        mode: "rectangle"
+                        size_hint_y: None
+                        height: dp(50)
+
+                    MDLabel:
+                        text: "4. What Happened?"
+                        bold: True
+                        adaptive_height: True
+
+                    MDLabel:
+                        text: "Please describe your complaint, concern, feedback, or suggestion:"
+                        theme_text_color: "Secondary"
+                        adaptive_height: True
+
+                    MDTextField:
+                        id: cfm_description
+                        hint_text: "Enter details here"
+                        mode: "rectangle"
+                        multiline: True
+                        size_hint_y: None
+                        height: dp(150)
+
+                    MDLabel:
+                        text: "5. Where Did It Happen?"
+                        bold: True
+                        adaptive_height: True
+
+                    MDTextField:
+                        id: cfm_incident_location
+                        hint_text: "Community/location"
+                        mode: "rectangle"
+                        size_hint_y: None
+                        height: dp(50)
+
+                    MDTextField:
+                        id: cfm_programme
+                        hint_text: "Programme/project"
+                        mode: "rectangle"
+                        size_hint_y: None
+                        height: dp(50)
+
+                    MDTextField:
+                        id: cfm_incident_date
+                        hint_text: "Date/time of incident (if applicable)"
+                        mode: "rectangle"
+                        size_hint_y: None
+                        height: dp(50)
+
+                    MDLabel:
+                        text: "6. Desired Solution / Action"
+                        bold: True
+                        adaptive_height: True
+
+                    MDLabel:
+                        text: "What would you like the NGO to do?"
+                        theme_text_color: "Secondary"
+                        adaptive_height: True
+
+                    MDTextField:
+                        id: cfm_solution
+                        hint_text: "Enter desired solution / action"
+                        mode: "rectangle"
+                        multiline: True
+                        size_hint_y: None
+                        height: dp(130)
+
+                    MDLabel:
+                        text: "7. Urgency"
+                        bold: True
+                        adaptive_height: True
+
+                    MDBoxLayout:
+                        spacing: dp(10)
+                        size_hint_y: None
+                        height: dp(40)
+                        CheckBox:
+                            id: urgency_normal
+                            group: "cfm_urgency"
+                            size_hint_x: None
+                            width: dp(20)
+                        MDLabel:
+                            text: "Normal"
+                        CheckBox:
+                            id: urgency_urgent
+                            group: "cfm_urgency"
+                            size_hint_x: None
+                            width: dp(20)
+                        MDLabel:
+                            text: "Urgent"
+                        CheckBox:
+                            id: urgency_confidential
+                            group: "cfm_urgency"
+                            size_hint_x: None
+                            width: dp(20)
+                        MDLabel:
+                            text: "Confidential/Sensitive"
+
+                    MDBoxLayout:
+                        spacing: dp(10)
+                        size_hint_y: None
+                        height: dp(40)
+                        CheckBox:
+                            id: urgency_immediate
+                            group: "cfm_urgency"
+                            size_hint_x: None
+                            width: dp(20)
+                        MDLabel:
+                            text: "Immediate protection concern"
+                        Widget:
+
+                    MDSeparator:
+
+                    MDLabel:
+                        text: "8. Staff Use Only"
+                        bold: True
+                        font_style: "Subtitle1"
+                        adaptive_height: True
+
+                    MDTextField:
+                        id: cfm_staff_date_received
+                        hint_text: "Date received"
+                        mode: "rectangle"
+                        on_touch_down: if self.collide_point(*args[1].pos): app.open_cfm_date_picker("cfm_staff_date_received")
+                        text: app.cfm_today_date()
+                        readonly: True
+                        size_hint_y: None
+                        height: dp(50)
+
+                    MDTextField:
+                        id: cfm_received_by
+                        hint_text: "Received by"
+                        mode: "rectangle"
+                        size_hint_y: None
+                        height: dp(50)
+
+                    MDTextField:
+                        id: cfm_staff_reference
+                        hint_text: "Reference number"
+                        mode: "rectangle"
+                        readonly: True
+                        size_hint_y: None
+                        height: dp(50)
+
+                    MDTextField:
+                        id: cfm_staff_category
+                        hint_text: "Complaint category"
+                        mode: "rectangle"
+                        size_hint_y: None
+                        height: dp(50)
+
+                    MDTextField:
+                        id: cfm_assigned_to
+                        hint_text: "Assigned to"
+                        mode: "rectangle"
+                        size_hint_y: None
+                        height: dp(50)
+
+                    MDTextField:
+                        id: cfm_target_response_date
+                        hint_text: "Target response date"
+                        mode: "rectangle"
+                        on_touch_down: if self.collide_point(*args[1].pos): app.open_cfm_date_picker("cfm_target_response_date")
+                        size_hint_y: None
+                        height: dp(50)
+
+                    MDTextField:
+                        id: cfm_office_name
+                        hint_text: "CFM Office Name"
+                        mode: "rectangle"
+                        size_hint_y: None
+                        height: dp(50)
+
+                    MDTextField:
+                        id: cfm_noted
+                        hint_text: "Noted"
+                        mode: "rectangle"
+                        size_hint_y: None
+                        height: dp(50)
+
+                    MDTextField:
+                        id: cfm_case_document
+                        hint_text: "Case Document — SELECT"
+                        mode: "rectangle"
+                        readonly: True
+                        right_icon: "menu-down"
+                        size_hint_y: None
+                        height: dp(50)
+                        on_touch_down: if self.collide_point(*args[1].pos): app.open_cfm_case_document_menu()
+
+                    MDTextField:
+                        id: cfm_review_management
+                        hint_text: "Review by management — SELECT"
+                        mode: "rectangle"
+                        readonly: True
+                        right_icon: "menu-down"
+                        size_hint_y: None
+                        height: dp(50)
+                        on_touch_down: if self.collide_point(*args[1].pos): app.open_cfm_management_review_menu()
+
+                    MDLabel:
+                        text: "Status"
+                        bold: True
+                        adaptive_height: True
+
+                    MDBoxLayout:
+                        spacing: dp(12)
+                        size_hint_y: None
+                        height: dp(40)
+                        CheckBox:
+                            id: status_open
+                            group: "cfm_status"
+                            size_hint_x: None
+                            width: dp(20)
+                        MDLabel:
+                            text: "Open"
+                        CheckBox:
+                            id: status_review
+                            group: "cfm_status"
+                            size_hint_x: None
+                            width: dp(20)
+                        MDLabel:
+                            text: "Under Review"
+                        CheckBox:
+                            id: status_closed
+                            group: "cfm_status"
+                            size_hint_x: None
+                            width: dp(20)
+                        MDLabel:
+                            text: "Closed"
+
+                    MDLabel:
+                        text: "Referral required?"
+                        bold: True
+                        adaptive_height: True
+
+                    MDBoxLayout:
+                        spacing: dp(12)
+                        size_hint_y: None
+                        height: dp(40)
+                        CheckBox:
+                            id: referral_yes
+                            group: "cfm_referral_required"
+                            size_hint_x: None
+                            width: dp(20)
+                        MDLabel:
+                            text: "Yes"
+                        CheckBox:
+                            id: referral_no
+                            group: "cfm_referral_required"
+                            size_hint_x: None
+                            width: dp(20)
+                        MDLabel:
+                            text: "No"
+
+                    MDTextField:
+                        id: cfm_referral_person
+                        hint_text: "Referral organisation/person"
+                        mode: "rectangle"
+                        size_hint_y: None
+                        height: dp(50)
+
+                    MDLabel:
+                        text: "9. Action Taken / Response"
+                        bold: True
+                        adaptive_height: True
+
+                    MDTextField:
+                        id: cfm_action_taken
+                        hint_text: "Record action taken / response"
+                        mode: "rectangle"
+                        multiline: True
+                        size_hint_y: None
+                        height: dp(130)
+
+                    MDLabel:
+                        text: "10. Complainant Follow-up"
+                        bold: True
+                        adaptive_height: True
+
+                    MDTextField:
+                        id: cfm_response_date
+                        disabled: not status_closed.active
+                        hint_text: "Response provided on"
+                        mode: "rectangle"
+                        size_hint_y: None
+                        height: dp(50)
+
+                    MDLabel:
+                        text: "Complainant informed:"
+                        bold: True
+                        adaptive_height: True
+
+                    MDBoxLayout:
+                        spacing: dp(12)
+                        size_hint_y: None
+                        height: dp(40)
+                        CheckBox:
+                            id: informed_yes
+                        disabled: not status_closed.active
+                            group: "cfm_informed"
+                            size_hint_x: None
+                            width: dp(20)
+                        MDLabel:
+                            text: "Yes"
+                        CheckBox:
+                            id: informed_no
+                        disabled: not status_closed.active
+                            group: "cfm_informed"
+                            size_hint_x: None
+                            width: dp(20)
+                        MDLabel:
+                            text: "No"
+
+                    MDLabel:
+                        text: "Complainant satisfied with response:"
+                        bold: True
+                        adaptive_height: True
+
+                    MDBoxLayout:
+                        spacing: dp(12)
+                        size_hint_y: None
+                        height: dp(40)
+                        CheckBox:
+                            id: satisfied_yes
+                        disabled: not status_closed.active
+                            group: "cfm_satisfied"
+                            size_hint_x: None
+                            width: dp(20)
+                        MDLabel:
+                            text: "Yes"
+                        CheckBox:
+                            id: satisfied_no
+                        disabled: not status_closed.active
+                            group: "cfm_satisfied"
+                            size_hint_x: None
+                            width: dp(20)
+                        MDLabel:
+                            text: "No"
+                        CheckBox:
+                            id: satisfied_na
+                        disabled: not status_closed.active
+                            group: "cfm_satisfied"
+                            size_hint_x: None
+                            width: dp(20)
+                        MDLabel:
+                            text: "Not available"
+
+                    MDLabel:
+                        text: "Further action required:"
+                        bold: True
+                        adaptive_height: True
+
+                    MDBoxLayout:
+                        spacing: dp(12)
+                        size_hint_y: None
+                        height: dp(40)
+                        CheckBox:
+                            id: further_yes
+                        disabled: not status_closed.active
+                            group: "cfm_further"
+                            size_hint_x: None
+                            width: dp(20)
+                        MDLabel:
+                            text: "Yes"
+                        CheckBox:
+                            id: further_no
+                        disabled: not status_closed.active
+                            group: "cfm_further"
+                            size_hint_x: None
+                            width: dp(20)
+                        MDLabel:
+                            text: "No"
+
+                    MDLabel:
+                        text: "11. Closure"
+                        bold: True
+                        adaptive_height: True
+
+                    MDTextField:
+                        id: cfm_closed_date
+                        disabled: not status_closed.active
+                        hint_text: "Date closed"
+                        mode: "rectangle"
+                        on_touch_down: if self.collide_point(*args[1].pos): app.open_cfm_date_picker("cfm_closed_date")
+                        size_hint_y: None
+                        height: dp(50)
+
+                    MDTextField:
+                        id: cfm_closed_by
+                        disabled: not status_closed.active
+                        hint_text: "Closed by"
+                        mode: "rectangle"
+                        size_hint_y: None
+                        height: dp(50)
+
+                    MDTextField:
+                        id: cfm_remarks
+                        disabled: not status_closed.active
+                        hint_text: "Remarks"
+                        mode: "rectangle"
+                        multiline: True
+                        size_hint_y: None
+                        height: dp(100)
+
+                    MDRaisedButton:
+                        text: "SAVE STAFF UPDATE"
+                        icon: "content-save-check-outline"
+                        size_hint_y: None
+                        height: dp(48)
+                        pos_hint: {"center_x": 0.5}
+                        md_bg_color: 0.13, 0.40, 0.16, 1
+                        on_release: app.save_cfm_staff_update()
+
+                    MDLabel:
+                        text: "Confidentiality Notice: Information provided through this form will be handled confidentially and used only for appropriate follow-up, accountability, safeguarding, and programme improvement. Anonymous complaints are accepted."
+                        font_style: "Caption"
+                        theme_text_color: "Hint"
+                        size_hint_y: None
+                        text_size: self.width, None
+                        height: self.texture_size[1] + dp(18)
+
+                    MDLabel:
+                        text: "On submission, the CFM case is saved locally and sent automatically to the configured ROHI Google Sheet."
+                        font_style: "Caption"
+                        theme_text_color: "Secondary"
+                        halign: "center"
+                        size_hint_y: None
+                        text_size: self.width, None
+                        height: self.texture_size[1] + dp(4)
+
+                    MDRaisedButton:
+                        text: "SUBMIT & SEND TO GOOGLE EXCEL"
+                        icon: "send-check-outline"
+                        size_hint_y: None
+                        height: dp(48)
+                        pos_hint: {"center_x": 0.5}
+                        md_bg_color: 0.13, 0.40, 0.16, 1
+                        on_release: app.submit_cfm_case()
+
+                    MDLabel:
+                        id: cfm_message
+                        text: ""
+                        halign: "center"
+                        theme_text_color: "Secondary"
+                        size_hint_y: None
+                        text_size: self.width, None
+                        height: self.texture_size[1] + dp(8)
+
+                    MDLabel:
+                        id: cfm_reference
+                        text: "Reference No.: -"
+                        bold: True
+                        halign: "center"
+                        theme_text_color: "Custom"
+                        text_color: 0.13, 0.40, 0.16, 1
+                        adaptive_height: True
+
+                    MDSeparator:
+
+                    MDLabel:
+                        text: "CFM Case Management"
+                        font_style: "Subtitle1"
+                        bold: True
+                        adaptive_height: True
+
+                    MDGridLayout:
+                        cols: 4
+                        spacing: dp(5)
+                        size_hint_y: None
+                        height: dp(66)
+
+                        MDCard:
+                            orientation: "vertical"
+                            padding: dp(4)
+                            radius: [8,]
+                            elevation: 1
+                            MDLabel:
+                                text: "Total"
+                                halign: "center"
+                                font_style: "Caption"
+                            MDLabel:
+                                id: cfm_total_count
+                                text: "0"
+                                halign: "center"
+                                bold: True
+                                font_size: "18sp"
+
+                        MDCard:
+                            orientation: "vertical"
+                            padding: dp(4)
+                            radius: [8,]
+                            elevation: 1
+                            MDLabel:
+                                text: "Open"
+                                halign: "center"
+                                font_style: "Caption"
+                            MDLabel:
+                                id: cfm_open_count
+                                text: "0"
+                                halign: "center"
+                                bold: True
+                                font_size: "18sp"
+                                theme_text_color: "Custom"
+                                text_color: 0.85, 0.55, 0.05, 1
+
+                        MDCard:
+                            orientation: "vertical"
+                            padding: dp(4)
+                            radius: [8,]
+                            elevation: 1
+                            MDLabel:
+                                text: "Under Review"
+                                halign: "center"
+                                font_style: "Caption"
+                            MDLabel:
+                                id: cfm_review_count
+                                text: "0"
+                                halign: "center"
+                                bold: True
+                                font_size: "18sp"
+                                theme_text_color: "Custom"
+                                text_color: 0.85, 0.55, 0.05, 1
+
+                        MDCard:
+                            orientation: "vertical"
+                            padding: dp(4)
+                            radius: [8,]
+                            elevation: 1
+                            MDLabel:
+                                text: "Closed"
+                                halign: "center"
+                                font_style: "Caption"
+                            MDLabel:
+                                id: cfm_closed_count
+                                text: "0"
+                                halign: "center"
+                                bold: True
+                                font_size: "18sp"
+                                theme_text_color: "Custom"
+                                text_color: 0.13, 0.40, 0.16, 1
+
+                    MDGridLayout:
+                        cols: 2
+                        spacing: dp(8)
+                        size_hint_y: None
+                        height: dp(100)
+
+                        MDTextField:
+                            id: cfm_manage_reference
+                            hint_text: "Case Reference No. to close"
+                            mode: "rectangle"
+                        MDTextField:
+                            id: cfm_manage_closed_by
+                            hint_text: "Closed by"
+                            mode: "rectangle"
+
+                    MDBoxLayout:
+                        spacing: dp(8)
+                        size_hint_y: None
+                        height: dp(46)
+                        MDRaisedButton:
+                            text: "REFRESH CASES"
+                            icon: "refresh"
+                            size_hint_x: 0.5
+                            on_release: app.refresh_cfm_cases()
+                        MDRaisedButton:
+                            text: "CLOSE SELECTED CASE"
+                            icon: "check-circle-outline"
+                            size_hint_x: 0.5
+                            md_bg_color: 0.13, 0.40, 0.16, 1
+                            on_release: app.close_cfm_case()
+
+                    MDLabel:
+                        id: cfm_case_list
+                        text: "No CFM cases yet."
+                        font_style: "Caption"
+                        theme_text_color: "Secondary"
+                        size_hint_y: None
+                        text_size: self.width, None
+                        height: self.texture_size[1] + dp(12)
