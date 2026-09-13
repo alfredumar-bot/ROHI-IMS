@@ -1,0 +1,25 @@
+ROHI IMS v1.9.2 - Google links locked behind Reset Database password
+
+1. All Google Sheet links and automatic upload endpoints in Server
+   Connection are now locked by default, the same way Reset Database is
+   protected:
+   - Attendance link + endpoint
+   - Timesheet link + endpoint
+   - Leave link + endpoint
+   - Staff link + endpoint
+   - CFM link + endpoint
+2. While locked: fields are greyed out/uneditable and the CONNECT
+   ATTENDANCE / CONNECT TIMESHEET / CONNECT LEAVE / CONNECT STAFF /
+   CONNECT CFM buttons are disabled.
+3. A "Locked" / "Unlocked" status badge plus an UNLOCK GOOGLE LINKS
+   button sits above the fields. Tapping it opens the same
+   administrator password prompt used for Reset Database
+   (Rohi@3313@). Entering the correct password unlocks viewing and
+   editing for the current visit to this screen.
+4. Leaving the screen (back arrow) automatically re-locks the links
+   again, so the next person who opens Server Connection must re-enter
+   the password.
+5. A LOCK GOOGLE LINKS button lets staff re-lock manually at any time
+   without leaving the screen.
+6. Existing saved links/endpoints are not affected or cleared by this
+   change - they are simply hidden from editing until unlocked.

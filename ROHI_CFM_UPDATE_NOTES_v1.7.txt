@@ -1,0 +1,10 @@
+ROHI CFM v1.7 update
+
+- CFM form now uses a clearly visible custom checkbox style throughout the CFM screen.
+- Type of Complaint / Feedback is now a real tap-to-select dropdown using the KivyMD menu.
+- CFM Google Sheet remains the same central link/endpoint workflow.
+- Settings now places the CFM link + CONNECT CFM controls before the Staff automatic upload endpoint, as requested.
+- CFM Excel/Google Sheet Status validation remains Open / Under Review / Closed.
+- APK pulls those three statuses from the same CFM endpoint every 60 seconds.
+- 15-minute staff inactivity timeout added. Android backgrounding for 15 minutes also expires the login session, and an expired stored session will not auto-restore.
+- Existing attendance, leave, staff, timesheet, DHIS2 and responsive phone/tablet features maintained.

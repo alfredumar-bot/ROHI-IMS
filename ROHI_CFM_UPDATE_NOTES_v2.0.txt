@@ -1,0 +1,11 @@
+ROHI CFM update v2.0
+
+- Added CFM Office Name, Noted, Case Document, Review by Management, with Status as the final column.
+- Case Document dropdown: Electronic / Hardcopy and filed / Both.
+- Review by Management dropdown: Yes / No.
+- Status dropdown: Open / Under Review / Closed.
+- Dashboard and CFM screen now show Total, Open, Under Review and Closed in one row.
+- Existing CFM local database is migrated safely without deleting records.
+- CFM staff follow-up/closure fields are enabled only when Closed is selected.
+- Google Sheet status changes continue to sync back to the APK.
+- State Office Drive setup remains non-destructive.

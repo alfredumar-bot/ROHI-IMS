@@ -1,0 +1,9 @@
+ROHI v2.6 staff auto-sync correction
+
+- Staff Registration now posts directly to the configured Apps Script staff endpoint.
+- Failed staff registrations are retained in a persistent local queue instead of being discarded.
+- Pending staff registrations automatically retry on the normal background auto-sync timer and after app restart.
+- Staff endpoint falls back to the built-in deployed endpoint if a saved setting is blank.
+- Excel connection checks now prefer the real Apps Script endpoint over a read-only published Sheet/folder link.
+- Apps Script staff submission validates the configured editable Staff Registration spreadsheet ID and returns spreadsheet/sheet metadata on success.
+- Existing staff data is never deleted by the sync correction.
