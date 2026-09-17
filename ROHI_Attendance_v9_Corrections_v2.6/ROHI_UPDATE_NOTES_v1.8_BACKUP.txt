@@ -1,0 +1,3 @@
+ROHI v1.8 - Full Backup & Restore
+
+Added Settings > Backup & Restore. EXPORT BACKUP creates a portable ZIP in the phone Downloads folder containing the local SQLite data (staff, attendance, leave, CFM), saved connection/sync configuration files, and staff photo/signature folders. IMPORT BACKUP validates the ZIP, restores the data/configuration, rewrites portable media paths for the new phone, clears the old login session, and requires a fresh login. session.json is deliberately excluded.

@@ -1,0 +1,117 @@
+<LoginScreen>:
+    MDScreen:
+        md_bg_color: 0.95, 0.95, 0.95, 1
+
+        ScrollView:
+            do_scroll_x: False
+            do_scroll_y: True
+
+            MDBoxLayout:
+                orientation: "vertical"
+                padding: "20dp"
+                spacing: "15dp"
+                size_hint_y: None
+                height: self.minimum_height
+                pos_hint: {"center_x": .5, "center_y": .5}
+
+                Image:
+                    source: "rohi_logo.png"
+                    size_hint: None, None
+                    size: "100dp", "100dp"
+                    pos_hint: {"center_x": .5}
+
+                MDLabel:
+                    text: "Restoration of Hope Initiative"
+                    font_style: "H6"
+                    bold: True
+                    halign: "center"
+                    size_hint_y: None
+                    height: "30dp"
+
+                MDLabel:
+                    text: "ROHI Staff Portal"
+                    font_style: "Subtitle2"
+                    theme_text_color: "Secondary"
+                    halign: "center"
+                    size_hint_y: None
+                    height: "20dp"
+
+                MDCard:
+                    orientation: "vertical"
+                    padding: "20dp"
+                    spacing: "15dp"
+                    size_hint_x: .95
+                    size_hint_y: None
+                    height: "310dp"
+                    pos_hint: {"center_x": .5}
+                    elevation: 3
+
+                    MDTextField:
+                        id: email
+                        hint_text: "Office Email or Staff Number"
+                        icon_right: "email"
+                        mode: "rectangle"
+
+                    MDTextField:
+                        id: password
+                        hint_text: "Password"
+                        password: True
+                        icon_right: "lock"
+                        mode: "rectangle"
+
+                    MDLabel:
+                        id: login_error_label
+                        text: ""
+                        theme_text_color: "Custom"
+                        text_color: 0.8, 0.1, 0.1, 1
+                        font_style: "Caption"
+                        halign: "center"
+                        size_hint_y: None
+                        height: self.texture_size[1] if self.text else 0
+
+                    MDRaisedButton:
+                        text: "LOGIN"
+                        font_size: "16sp"
+                        size_hint_x: 1
+                        height: "48dp"
+                        md_bg_color: 0, 0.6, 0.2, 1
+                        on_release:
+                            login_error_label.text = ""
+                            app.perform_login()
+
+                    MDRectangleFlatButton:
+                        text: "Register New Staff"
+                        pos_hint: {"center_x": .5}
+                        on_release: app.open_registration()
+
+                    MDTextButton:
+                        text: "Forgot Password?"
+                        pos_hint: {"center_x": .5}
+                        on_release: app.forgot_password()
+
+                # ---------------- Restore Backup (recovery before login) ----------------
+                MDBoxLayout:
+                    orientation: "vertical"
+                    spacing: "6dp"
+                    size_hint_x: .95
+                    size_hint_y: None
+                    height: self.minimum_height
+                    pos_hint: {"center_x": .5}
+                    padding: [0, "10dp", 0, 0]
+
+                    MDRectangleFlatButton:
+                        text: "RESTORE BACKUP"
+                        icon: "database-import-outline"
+                        pos_hint: {"center_x": .5}
+                        line_color: 0.13, 0.40, 0.16, 1
+                        text_color: 0.13, 0.40, 0.16, 1
+                        on_release: app.import_full_backup()
+
+                    MDLabel:
+                        id: login_backup_status_label
+                        text: "If the app crashed or this is a new phone, restore a previous ROHI backup here."
+                        font_style: "Caption"
+                        theme_text_color: "Secondary"
+                        halign: "center"
+                        adaptive_height: True
+                        text_size: self.width, None

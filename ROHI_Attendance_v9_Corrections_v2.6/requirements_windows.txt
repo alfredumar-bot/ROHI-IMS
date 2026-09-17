@@ -1,0 +1,15 @@
+# ROHI IMS - Windows PC build requirements
+python-dateutil
+kivy==2.3.1
+kivymd==1.2.0
+plyer
+openpyxl
+et_xmlfile
+reportlab
+pypdf
+cryptography
+msoffcrypto-tool
+pillow
+pg8000
+certifi
+pyinstaller>=6.0

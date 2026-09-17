@@ -1,0 +1,43 @@
+ROHI IMS v2.0 – requested dashboard/CFM/Google/attendance update
+
+Implemented in this package:
+1. Dashboard quick-link row added at the profile-card yellow-line area:
+   Gmail, Google Meet, Power BI, DHIS2 and Website.
+   - Meet prefers the installed Google Meet Android app and falls back to the URL.
+   - Gmail opens Gmail directly and attaches the latest generated ROHI report when one exists.
+   - Website opens in the browser.
+   - Power BI/DHIS2 show “link will be provided shortly” until their production URLs are supplied.
+2. Dashboard social footer added:
+   WhatsApp, LinkedIn, Facebook, Twitter, Instagram and TikTok.
+   Supplied LinkedIn/Facebook/TikTok URLs are embedded. WhatsApp/Twitter/Instagram remain placeholders.
+3. Timesheet filename format:
+   “A Umar 08-2026 Borno.xlsx” for Alfred Umar, August 2026, Borno.
+   The workbook still stores the period as month/year. Android filenames cannot safely contain “/”.
+4. Leave export uses the same staff/state/month naming pattern.
+5. One Google Apps Script endpoint is used for Timesheet and Leave.
+   The script routes uploads into State Office subfolders under the configured Timesheet/Leave root folders.
+   No separate APK link is required for each state office.
+6. Attendance geofencing now checks the five active ROHI offices:
+   Borno State Office, Adamawa HQ, Yobe State Office, Taraba State Office, Benue State Office.
+   A staff member keeps the original registered State Office but can check in/out at another configured office while on assignment.
+   The current State Office is recorded from the live GPS location and included in attendance reporting/Google sync.
+7. CFM:
+   - Type of Complaint / Feedback uses a touch-open dropdown.
+   - CFM checkboxes start unchecked.
+   - Checkbox visual size reduced.
+   - Status reduced to Open / Under Review / Closed.
+   - Date received and staff follow-up dates use a date picker.
+   - Submit button explicitly says SUBMIT & SEND TO GOOGLE EXCEL.
+   - CFM endpoint is pointed at the shared Apps Script endpoint.
+   - Exact body header remains: ROHI COMPLAINTS & FEEDBACK MECHANISM (CFM), Community & Office Level.
+   - Duplicate/truncated top CFM title was replaced by compact “ROHI CFM” app bar title.
+8. Settings:
+   Added the missing app.open_settings() handler, which fixes the dashboard Settings action that could leave the user on a blank/black screen.
+   “Designed by Fred Umar” is now smaller and not bold.
+9. Backup/restore code from the supplied package is retained.
+10. ReportLab workaround, buildozer configuration and existing sync infrastructure are retained; version bumped to 2.0 / Android numeric version 6.
+
+Google-side one-time setup still required:
+- Set CONFIG.cfmSpreadsheetId in google_drive_upload.gs to the normal editable CFM Google Spreadsheet ID (or bind the script to that spreadsheet).
+- Deploy/update the Apps Script Web App after replacing the script, then keep the same /exec endpoint in the APK.
+- When ROHI supplies Power BI, DHIS2, WhatsApp, Instagram and Twitter URLs, place them in ROHI_EXTERNAL_LINKS in main.py.

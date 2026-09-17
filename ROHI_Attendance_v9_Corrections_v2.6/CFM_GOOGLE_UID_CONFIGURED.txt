@@ -1,0 +1,6 @@
+CFM Google Spreadsheet ID configured in google_drive_upload.gs:
+16dFEsbp4vEV5b_2eR7v90VEjnKuKYzbw
+
+Status workflow: Open -> Under Review -> Closed.
+Total count means all captured CFM cases.
+State Office folder setup is non-destructive; it never deletes existing folders or reports.
