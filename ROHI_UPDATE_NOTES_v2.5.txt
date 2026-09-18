@@ -1,0 +1,13 @@
+ROHI v2.5 correction release
+
+- Dashboard sync status now counts all 7 configured report links.
+- CFM Google Sheet link is preconfigured and remains usable while fields are locked.
+- Power BI, DHIS2 and ROHI Website dashboard buttons now open real destinations.
+- Added WhatsApp app launcher with web fallback.
+- Added image-based Power BI and DHIS2 dashboard logos and browser logo.
+- DWPT and Monthly uploads use the correct Apps Script report type; Monthly now routes to monthly_report state folders.
+- Added visible send status labels to Leave, DWPT and Monthly screens.
+- Gmail attachment sharing is forced to Gmail for Timesheet/Leave/DWPT/Monthly and uses Android content URIs.
+- Excel link connection state is preserved through transient network failures after a successful connection.
+- Borno GPS remains 11.798630, 13.145316; five-office geofence logic remains nearest-office based.
+- Existing Drive folders/reports remain non-destructive.

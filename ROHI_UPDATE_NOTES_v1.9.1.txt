@@ -1,0 +1,40 @@
+ROHI IMS v1.9.1 - Settings/Login backup layout + CFM rebuild note
+
+1. CFM checkboxes and dropdown (root cause)
+- cfm.kv already defines a visible custom checkbox style (green outline/tick,
+  used by Sex, Anonymous, Response Method, Urgency, Status, Follow-up, etc.)
+  and "Type of Complaint / Feedback" already opens a real KivyMD
+  MDDropdownMenu (app.open_cfm_type_menu in main.py) with the full 14-item
+  list plus the "Other: please specify" field.
+- No other .kv file overrides <CheckBox>, and CFMScreen(name="cfm") plus
+  cfm.kv are both loaded/registered correctly in main.py.
+- If checkboxes/dropdown are still not visible on the phone, the APK being
+  tested was not rebuilt from this exact ZIP. Android will keep showing the
+  old screen if you reinstall an older-built APK, or if buildozer used a
+  stale .buildozer/ cache. Fix: buildozer android clean, then
+  buildozer -v android debug (or release) from THIS folder, uninstall the
+  old app from the phone first, then install the freshly built APK.
+
+2. Settings screen
+- Added a "Complaints & Feedback (CFM)" card (icon + short description +
+  OPEN CFM button) directly under Server Connection, matching the style of
+  the other links.
+- Reordered so "Backup & Restore" now appears BELOW "Reset Database" (it
+  previously appeared above it).
+
+3. Server Connection screen
+- Confirmed CFM link + CONNECT CFM + CFM automatic upload endpoint already
+  appear before the Staff automatic upload endpoint field. No change needed
+  here.
+
+4. Login screen
+- Added a "RESTORE BACKUP" button (restore-only, no export) below the
+  login/registration/forgot-password controls, calling the same
+  import_full_backup() used elsewhere, so a crashed app or a new phone can
+  be recovered before anyone logs in.
+- Backup status messages now also display on the login screen.
+
+5. 15-minute staff inactivity logout
+- Confirmed already implemented (STAFF_IDLE_TIMEOUT_SECONDS = 15*60 in
+  main.py): idle in-app time and Android backgrounding both expire the
+  session after 15 minutes and force a fresh login.
